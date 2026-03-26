@@ -25,6 +25,8 @@ func (rm *RoomManager) handleCreateRoomAPI(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	rm.CreateRoom(req.RoomId, req.Token)
+
 	w.WriteHeader(http.StatusCreated)
 }
 
@@ -33,6 +35,7 @@ func handleAudioStream(rm *RoomManager, w http.ResponseWriter, r *http.Request) 
 	roomID := r.URL.Query().Get("room")
 	if roomID == "" {
 		roomID = "general" // Default fallback
+		return
 	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)

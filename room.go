@@ -44,19 +44,22 @@ func (rm *RoomManager) CreateRoom(roomID string, token string) *Room {
 }
 
 // JoinRoom adds a client to a specific room, creating it if it doesn't exist
-func (rm *RoomManager) JoinRoom(roomID string, conn *websocket.Conn) *Room {
+func (rm *RoomManager) JoinRoom(roomID string, token string, conn *websocket.Conn) *Room {
 	rm.mutex.Lock()
 	defer rm.mutex.Unlock()
 
 	room, exists := rm.rooms[roomID]
+
+	// Does room exists
 	if !exists {
-		// Create a new room if it's the first person joining
-		room = &Room{
-			id:      roomID,
-			clients: make(map[*websocket.Conn]bool),
-		}
-		rm.rooms[roomID] = room
-		fmt.Printf("Created new room: %s\n", roomID)
+		fmt.Printf("Tried to connect to non-existent room: %s", roomID)
+		return nil
+	}
+
+	// Is token correct
+	if room.token != token {
+		fmt.Printf("Tried to join room with incorrect token: %s", roomID)
+		return nil
 	}
 
 	// Lock the specific room and add the client
@@ -102,7 +105,10 @@ func (r *Room) Broadcast(sender *websocket.Conn, message []byte) {
 			err := client.WriteMessage(websocket.BinaryMessage, message)
 			if err != nil {
 				log.Printf("Error broadcasting to a client in room %s: %v", r.id, err)
-				client.Close()
+				err := client.Close()
+				if err != nil {
+					log.Printf("Dead connection in room %s: %v", r.id, err)
+				}
 				delete(r.clients, client)
 			}
 		}
