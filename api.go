@@ -30,11 +30,42 @@ func (rm *RoomManager) handleCreateRoomAPI(w http.ResponseWriter, r *http.Reques
 	w.WriteHeader(http.StatusCreated)
 }
 
+func (rm *RoomManager) handleCheckRoomAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	roomID := r.URL.Query().Get("room")
+	exists := rm.DoesRoomExist(roomID)
+
+	if exists {
+		w.WriteHeader(http.StatusOK)
+	} else {
+		w.WriteHeader(http.StatusNotFound)
+	}
+}
+
 func handleAudioStream(rm *RoomManager, w http.ResponseWriter, r *http.Request) {
 	// Extract room ID from query parameter (e.g., ?room=test)
 	roomID := r.URL.Query().Get("room")
 	if roomID == "" {
-		roomID = "general" // Default fallback
+		log.Println("Missing room name")
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	userId := r.URL.Query().Get("userid")
+	if userId == "" {
+		log.Println("Missing room userid")
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	token := r.URL.Query().Get("token")
+	if token == "" {
+		log.Println("Missing room token")
+		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
 
@@ -46,7 +77,12 @@ func handleAudioStream(rm *RoomManager, w http.ResponseWriter, r *http.Request) 
 	defer conn.Close()
 
 	// 1. Client joins the requested room
-	room := rm.JoinRoom(roomID, conn)
+	room := rm.JoinRoom(roomID, token, userId, conn)
+
+	if room == nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
 
 	// 2. Ensure the client is removed when they disconnect
 	defer rm.LeaveRoom(roomID, conn)
@@ -55,7 +91,6 @@ func handleAudioStream(rm *RoomManager, w http.ResponseWriter, r *http.Request) 
 	for {
 		messageType, message, err := conn.ReadMessage()
 		if err != nil {
-			log.Printf("Client disconnected from room [%s]: %v\n", roomID, err)
 			break
 		}
 
