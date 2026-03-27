@@ -15,7 +15,7 @@ var upgrader = websocket.Upgrader{
 }
 
 func GetPort() string {
-	port := os.Getenv("PORT")
+	port := os.Getenv("SQRLL_VOICE_PORT")
 	if port == "" {
 		port = "8080" // Fallback
 	}
