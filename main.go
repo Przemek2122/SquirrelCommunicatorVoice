@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 
 	"github.com/gorilla/websocket"
 )
@@ -12,15 +11,6 @@ import (
 var upgrader = websocket.Upgrader{
 	// @TODO Temp allow anything
 	CheckOrigin: func(r *http.Request) bool { return true },
-}
-
-func GetPort() string {
-	port := os.Getenv("SQRLL_VOICE_PORT")
-	if port == "" {
-		port = "8080" // Fallback
-	}
-
-	return fmt.Sprintf(":%s", port)
 }
 
 // --- Main Application Entrypoint ---
@@ -31,6 +21,12 @@ func main() {
 
 	// Debug room
 	manager.CreateRoom("test", "test")
+
+	// Ensure we have APIKey or log
+	manager.APIKey = GetAPIKey()
+	if manager.APIKey == "" { // @TODO: Temporary allow empty key
+		log.Printf("[WARNING] Server APIKey missing, we will allow anyone")
+	}
 
 	http.HandleFunc("/api/rooms/create", manager.handleCreateRoomAPI)
 	http.HandleFunc("/api/rooms/check", manager.handleCheckRoomAPI)

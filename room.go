@@ -28,7 +28,12 @@ type Room struct {
 // RoomManager holds the state of the entire microservice
 type RoomManager struct {
 	rooms map[string]*Room
+
+	/** Mutex for changing anything in rooms structure */
 	mutex sync.RWMutex
+
+	/** API Key - Password to allow editing sensitive fields called from other server. */
+	APIKey string
 }
 
 // NewRoomManager is a constructor for our service

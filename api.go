@@ -16,12 +16,20 @@ type CreateRoomRequest struct {
 func (rm *RoomManager) handleCreateRoomAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
 	}
 
 	var req CreateRoomRequest
 	err := json.NewDecoder(r.Body).Decode(&req)
 	if err != nil {
 		http.Error(w, "Incorrect JSON", http.StatusBadRequest)
+		return
+	}
+
+	// Check token (Server should send auth)
+	clientToken := r.Header.Get("X-API-Token")
+	if clientToken != rm.APIKey {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -36,7 +44,19 @@ func (rm *RoomManager) handleCheckRoomAPI(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Check token (Server should send auth)
+	clientToken := r.Header.Get("X-API-Token")
+	if clientToken != rm.APIKey {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	roomID := r.URL.Query().Get("room")
+	if roomID == "" {
+		http.Error(w, "Missing room name", http.StatusBadRequest)
+		return
+	}
+
 	exists := rm.DoesRoomExist(roomID)
 
 	if exists {
@@ -47,25 +67,27 @@ func (rm *RoomManager) handleCheckRoomAPI(w http.ResponseWriter, r *http.Request
 }
 
 func handleAudioStream(rm *RoomManager, w http.ResponseWriter, r *http.Request) {
-	// Extract room ID from query parameter (e.g., ?room=test)
+	// Get room name
 	roomID := r.URL.Query().Get("room")
 	if roomID == "" {
 		log.Println("Missing room name")
-		w.WriteHeader(http.StatusNotFound)
+		http.Error(w, "Missing room name", http.StatusNotFound)
 		return
 	}
 
+	// Get user id
 	userId := r.URL.Query().Get("userid")
 	if userId == "" {
 		log.Println("Missing room userid")
-		w.WriteHeader(http.StatusNotFound)
+		http.Error(w, "Missing room userid", http.StatusNotFound)
 		return
 	}
 
+	// Get room token (password)
 	token := r.URL.Query().Get("token")
 	if token == "" {
 		log.Println("Missing room token")
-		w.WriteHeader(http.StatusUnauthorized)
+		http.Error(w, "Missing room token", http.StatusUnauthorized)
 		return
 	}
 
