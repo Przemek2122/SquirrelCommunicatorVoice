@@ -122,3 +122,18 @@ func handleAudioStream(rm *RoomManager, w http.ResponseWriter, r *http.Request) 
 		}
 	}
 }
+
+// handleHealthCheck responds with a 200 OK to indicate the server is alive.
+func handleHealthCheck(w http.ResponseWriter, r *http.Request) {
+	// We only want to allow GET requests here
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Explicitly set the 200 OK status
+	w.WriteHeader(http.StatusOK)
+
+	// Write a simple text response (or you could do JSON like `{"status":"ok"}`)
+	w.Write([]byte("OK"))
+}

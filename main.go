@@ -36,6 +36,8 @@ func main() {
 		handleAudioStream(manager, w, r)
 	})
 
+	http.HandleFunc("/health", handleHealthCheck)
+
 	port := GetPort()
 	fmt.Printf("Go Microservice (Rooms) listening on port '%s'...", port)
 	err := http.ListenAndServe(port, nil)
