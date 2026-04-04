@@ -43,9 +43,19 @@ func NewRoomManager() *RoomManager {
 	}
 }
 
+/** Create room or get if exists and token matches */
 func (rm *RoomManager) CreateRoom(roomID string, token string) *Room {
 	rm.mutex.Lock()
 	defer rm.mutex.Unlock()
+
+	roomIfExists, exists := rm.rooms[roomID]
+	if exists {
+		if roomIfExists.token != token {
+			fmt.Printf("Tried to join room with incorrect token: %s", roomID)
+			return nil
+		}
+		return roomIfExists
+	}
 
 	room := &Room{
 		id:           roomID,
