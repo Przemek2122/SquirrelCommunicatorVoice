@@ -19,10 +19,17 @@ func (rm *RoomManager) handleCreateRoomAPI(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Decode JSON
 	var req CreateRoomRequest
 	err := json.NewDecoder(r.Body).Decode(&req)
 	if err != nil {
 		http.Error(w, "Incorrect JSON", http.StatusBadRequest)
+		return
+	}
+
+	// Check if JSON has RoomId
+	if req.RoomId == "" {
+		http.Error(w, "Missing roomId", http.StatusBadRequest)
 		return
 	}
 

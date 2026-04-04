@@ -57,7 +57,7 @@ func (rm *RoomManager) CreateRoom(roomID string, token string) *Room {
 
 	// Destroy room when empty for 15 minutes
 	room.idleTimer = time.AfterFunc(15*time.Minute, func() {
-		rm.destroyRoom(roomID) // To nowa funkcja, zaraz ją omówimy
+		rm.destroyRoom(roomID)
 	})
 
 	return room
