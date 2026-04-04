@@ -8,7 +8,7 @@ import (
 func GetPort() string {
 	port := os.Getenv("SQRLL_VOICE_PORT")
 	if port == "" {
-		port = "8080" // Fallback
+		port = "8082" // Fallback
 	}
 
 	return fmt.Sprintf(":%s", port)
