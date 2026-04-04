@@ -13,7 +13,7 @@ COPY . .
 
 # Build the executable
 # CGO_ENABLED=0 ensures a statically linked binary (no external C libraries required)
-RUN CGO_ENABLED=0 GOOS=linux go build -o voice_app main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -o voice_app .
 
 # Stage 2: Lightweight target image
 FROM alpine:latest
