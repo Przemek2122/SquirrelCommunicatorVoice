@@ -4,6 +4,9 @@ FROM golang:1.25-alpine AS builder
 # Set the working directory inside the container
 WORKDIR /app
 
+# Add CURL for health check on docker
+RUN apk add --no-cache curl
+
 # Copy dependency files and download them
 COPY go.mod go.sum ./
 RUN go mod download
