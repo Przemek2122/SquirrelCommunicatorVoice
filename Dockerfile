@@ -4,9 +4,6 @@ FROM golang:1.25-alpine AS builder
 # Set the working directory inside the container
 WORKDIR /app
 
-# Add CURL for health check on docker
-RUN apk add --no-cache curl
-
 # Copy dependency files and download them
 COPY go.mod go.sum ./
 RUN go mod download
@@ -20,6 +17,9 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o voice_app .
 
 # Stage 2: Lightweight target image
 FROM alpine:latest
+
+# Add CURL for health check on docker
+RUN apk add --no-cache curl
 
 # Set the working directory for the final image
 WORKDIR /root/
