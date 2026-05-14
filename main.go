@@ -26,6 +26,8 @@ func main() {
 	manager.APIKey = GetAPIKey()
 	if manager.APIKey == "" { // @TODO: Temporary allow empty key
 		log.Printf("[WARNING] Server APIKey missing, we will allow anyone")
+	} else {
+		fmt.Printf("Server has APIKey and will require it to connect\n")
 	}
 
 	http.HandleFunc("/api/rooms/create", manager.handleCreateRoomAPI)

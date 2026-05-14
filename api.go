@@ -19,6 +19,13 @@ func (rm *RoomManager) handleCreateRoomAPI(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Check token (Server should send auth)
+	clientToken := r.Header.Get("X-API-Token")
+	if clientToken != rm.APIKey {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	// Decode JSON
 	var req CreateRoomRequest
 	err := json.NewDecoder(r.Body).Decode(&req)
@@ -33,16 +40,18 @@ func (rm *RoomManager) handleCreateRoomAPI(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Check token (Server should send auth)
-	clientToken := r.Header.Get("X-API-Token")
-	if clientToken != rm.APIKey {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-
 	rm.CreateRoom(req.RoomId, req.Token)
 
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
+
+	jeer := json.NewEncoder(w).Encode(map[string]interface{}{
+		"created": true,
+		"roomId":  req.RoomId,
+	})
+	if jeer != nil {
+		return
+	}
 }
 
 func (rm *RoomManager) handleCheckRoomAPI(w http.ResponseWriter, r *http.Request) {
@@ -66,10 +75,12 @@ func (rm *RoomManager) handleCheckRoomAPI(w http.ResponseWriter, r *http.Request
 
 	exists := rm.DoesRoomExist(roomID)
 
-	if exists {
-		w.WriteHeader(http.StatusOK)
-	} else {
-		w.WriteHeader(http.StatusNotFound)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	err := json.NewEncoder(w).Encode(map[string]bool{"exists": exists})
+	if err != nil {
+		return
 	}
 }
 
