@@ -23,6 +23,11 @@ type Room struct {
 
 	/** Timer for room delete when empty */
 	idleTimer *time.Timer
+
+	// --- Screen share fields ---
+	screenPublisher   *websocket.Conn            // Only one publisher per room
+	screenViewers     map[*websocket.Conn]string // Viewers receiving the screen stream
+	screenInitSegment []byte                     // Cached VP8/VP9 init segment for late joiners
 }
 
 // RoomManager holds the state of the entire microservice
@@ -58,19 +63,93 @@ func (rm *RoomManager) CreateRoom(roomID string, token string) *Room {
 	}
 
 	room := &Room{
-		id:           roomID,
-		token:        token,
-		clients:      make(map[*websocket.Conn]string),
-		initSegments: make(map[*websocket.Conn][]byte),
+		id:            roomID,
+		token:         token,
+		clients:       make(map[*websocket.Conn]string),
+		initSegments:  make(map[*websocket.Conn][]byte),
+		screenViewers: make(map[*websocket.Conn]string),
 	}
 	rm.rooms[roomID] = room
 
-	// Destroy room when empty for 15 minutes
-	room.idleTimer = time.AfterFunc(15*time.Minute, func() {
+	// Destroy room when empty for 10 minutes
+	room.idleTimer = time.AfterFunc(10*time.Minute, func() {
 		rm.destroyRoom(roomID)
 	})
 
 	return room
+}
+
+// UpdateRoomToken changes the access token for an existing room.
+// Returns false if the room does not exist.
+func (rm *RoomManager) UpdateRoomToken(roomID string, newToken string) bool {
+	rm.mutex.RLock()
+	room, exists := rm.rooms[roomID]
+	rm.mutex.RUnlock()
+
+	if !exists {
+		fmt.Printf("Tried to update token for non-existent room: %s\n", roomID)
+		return false
+	}
+
+	room.SetToken(newToken)
+	fmt.Printf("Token updated for room [%s]\n", roomID)
+	return true
+}
+
+// RemoveRoom forcefully removes a room and disconnects all participants.
+// Returns false if the room does not exist.
+func (rm *RoomManager) RemoveRoom(roomID string) bool {
+	rm.mutex.Lock()
+	room, exists := rm.rooms[roomID]
+	if !exists {
+		rm.mutex.Unlock()
+		fmt.Printf("Tried to remove non-existent room: %s\n", roomID)
+		return false
+	}
+
+	// Remove from map immediately so new joins can't find it
+	delete(rm.rooms, roomID)
+	rm.mutex.Unlock()
+
+	// Stop the idle timer — no need for destroyRoom to fire on a removed room
+	room.idleTimer.Stop()
+
+	// Collect all connections under the room lock
+	room.mutex.Lock()
+	allConns := make([]*websocket.Conn, 0, len(room.clients)+len(room.screenViewers)+1)
+	for conn := range room.clients {
+		allConns = append(allConns, conn)
+	}
+	if room.screenPublisher != nil {
+		allConns = append(allConns, room.screenPublisher)
+	}
+	for conn := range room.screenViewers {
+		allConns = append(allConns, conn)
+	}
+	// Clear maps so deferred LeaveRoom / RemoveScreenViewer are harmless no-ops
+	room.clients = make(map[*websocket.Conn]string)
+	room.initSegments = make(map[*websocket.Conn][]byte)
+	room.screenPublisher = nil
+	room.screenViewers = make(map[*websocket.Conn]string)
+	room.screenInitSegment = nil
+	totalClients := len(allConns)
+	room.mutex.Unlock()
+
+	// Close all connections outside any lock — prevents deadlocks
+	// with deferred LeaveRoom / ClearScreenPublisher running in other goroutines
+	for _, conn := range allConns {
+		conn.Close()
+	}
+
+	fmt.Printf("Room [%s] forcefully removed, %d client(s) disconnected\n", roomID, totalClients)
+	return true
+}
+
+// SetToken updates the room's access token in a thread-safe manner.
+func (r *Room) SetToken(newToken string) {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	r.token = newToken
 }
 
 // JoinRoom adds a client to a specific room, creating it if it doesn't exist
@@ -131,7 +210,7 @@ func (rm *RoomManager) LeaveRoom(roomID string, conn *websocket.Conn) {
 	room.mutex.Lock()
 	delete(room.clients, conn)
 	delete(room.initSegments, conn)
-	isEmpty := len(room.clients) == 0
+	isEmpty := room.isFullyEmpty()
 	room.mutex.Unlock()
 
 	fmt.Printf("Client left room [%s].\n", roomID)
@@ -142,6 +221,26 @@ func (rm *RoomManager) LeaveRoom(roomID string, conn *websocket.Conn) {
 	}
 }
 
+// GetRoom validates room existence and token WITHOUT adding to any client list.
+// Used by screen share to validate access before adding to screen-specific maps.
+func (rm *RoomManager) GetRoom(roomID string, token string) *Room {
+	rm.mutex.RLock()
+	room, exists := rm.rooms[roomID]
+	rm.mutex.RUnlock()
+
+	if !exists {
+		fmt.Printf("Tried to connect to non-existent room: %s\n", roomID)
+		return nil
+	}
+
+	if room.token != token {
+		fmt.Printf("Tried to join room with incorrect token: %s\n", roomID)
+		return nil
+	}
+
+	return room
+}
+
 func (rm *RoomManager) DoesRoomExist(roomID string) bool {
 	rm.mutex.RLock()
 	defer rm.mutex.RUnlock()
@@ -150,21 +249,46 @@ func (rm *RoomManager) DoesRoomExist(roomID string) bool {
 	return exists
 }
 
+// isFullyEmpty checks if the room has NO participants of any kind (audio + screen).
+// Must be called with room.mutex held.
+func (r *Room) isFullyEmpty() bool {
+	return len(r.clients) == 0 && len(r.screenViewers) == 0 && r.screenPublisher == nil
+}
+
+// resetIdleIfEmpty starts the idle destruction timer if the room has zero participants.
+func (rm *RoomManager) resetIdleIfEmpty(roomID string) {
+	rm.mutex.RLock()
+	room, exists := rm.rooms[roomID]
+	rm.mutex.RUnlock()
+	if !exists {
+		return
+	}
+
+	room.mutex.Lock()
+	defer room.mutex.Unlock()
+
+	if room.isFullyEmpty() {
+		room.idleTimer.Reset(10 * time.Minute)
+		fmt.Printf("Room [%s] is now fully empty, idle timer started.\n", roomID)
+	}
+}
+
 func (rm *RoomManager) destroyRoom(roomID string) {
 	rm.mutex.Lock()
 	defer rm.mutex.Unlock()
 
 	room, exists := rm.rooms[roomID]
+	if !exists {
+		return
+	}
 
-	if exists {
-		room.mutex.Lock()
-		isEmpty := len(room.clients) == 0
-		room.mutex.Unlock()
+	room.mutex.Lock()
+	isEmpty := room.isFullyEmpty()
+	room.mutex.Unlock()
 
-		if isEmpty {
-			delete(rm.rooms, roomID)
-			fmt.Printf("Room [%s] is empty and was destroyed.\n", roomID)
-		}
+	if isEmpty {
+		delete(rm.rooms, roomID)
+		fmt.Printf("Room [%s] is empty and was destroyed.\n", roomID)
 	}
 }
 
@@ -207,11 +331,119 @@ func (r *Room) Broadcast(sender *websocket.Conn, message []byte) {
 		if err != nil {
 			log.Printf("Error broadcasting to a client in room %s: %v", r.id, err)
 
-			// If a connection is dead, we need to lock again just to clean it up
-			r.mutex.Lock()
+			// Close the dead connection; the caller's deferred LeaveRoom will
+			// handle removing it from the room's client map and idle timer logic.
 			client.Close()
-			delete(r.clients, client)
-			r.mutex.Unlock()
+		}
+	}
+}
+
+// --- Screen Share Methods ---
+
+// SetScreenPublisher attempts to register a connection as the screen publisher.
+// Returns false if there's already an active publisher.
+func (r *Room) SetScreenPublisher(conn *websocket.Conn, userId string) bool {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	if r.screenPublisher != nil {
+		return false
+	}
+
+	r.screenPublisher = conn
+	r.idleTimer.Stop() // Room is active
+	fmt.Printf("Screen publisher [%s] started in room [%s]\n", userId, r.id)
+	return true
+}
+
+// ClearScreenPublisher removes the screen publisher and closes all viewer connections.
+func (r *Room) ClearScreenPublisher(conn *websocket.Conn) []*websocket.Conn {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	if r.screenPublisher != conn {
+		return nil
+	}
+
+	r.screenPublisher = nil
+	r.screenInitSegment = nil
+
+	// Collect all viewer connections to close them outside the lock
+	viewers := make([]*websocket.Conn, 0, len(r.screenViewers))
+	for vConn := range r.screenViewers {
+		viewers = append(viewers, vConn)
+	}
+	// Clear the viewer map
+	r.screenViewers = make(map[*websocket.Conn]string)
+
+	fmt.Printf("Screen publisher left room [%s], %d viewers disconnected\n", r.id, len(viewers))
+	return viewers
+}
+
+// AddScreenViewer registers a connection as a screen viewer and stops the idle timer.
+func (r *Room) AddScreenViewer(conn *websocket.Conn, userId string) {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	r.screenViewers[conn] = userId
+	r.idleTimer.Stop()
+	fmt.Printf("Screen viewer [%s] joined room [%s]. Total viewers: %d\n", userId, r.id, len(r.screenViewers))
+}
+
+// RemoveScreenViewer removes a screen viewer connection.
+func (r *Room) RemoveScreenViewer(conn *websocket.Conn) {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	delete(r.screenViewers, conn)
+	fmt.Printf("Screen viewer left room [%s]. Remaining viewers: %d\n", r.id, len(r.screenViewers))
+}
+
+// GetScreenInitSegment returns the cached screen init segment (or nil).
+// Safe to call without holding the mutex externally; we lock internally.
+func (r *Room) GetScreenInitSegment() []byte {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	if r.screenInitSegment == nil {
+		return nil
+	}
+	// Return a copy to avoid data races
+	seg := make([]byte, len(r.screenInitSegment))
+	copy(seg, r.screenInitSegment)
+	return seg
+}
+
+// BroadcastScreen sends a binary video message to all screen viewers (not the publisher).
+// Caches WebM initialization chunks for late-joining viewers.
+func (r *Room) BroadcastScreen(sender *websocket.Conn, message []byte) {
+	r.mutex.Lock()
+
+	// 1. Detect WebM EBML magic bytes — cache as init segment for late joiners
+	if len(message) >= 4 && message[0] == 0x1A && message[1] == 0x45 && message[2] == 0xDF && message[3] == 0xA3 {
+		r.screenInitSegment = make([]byte, len(message))
+		copy(r.screenInitSegment, message)
+	}
+
+	// 2. Fast copy of target viewers (exclude sender)
+	targets := make([]*websocket.Conn, 0, len(r.screenViewers))
+	for client := range r.screenViewers {
+		if client != sender {
+			targets = append(targets, client)
+		}
+	}
+
+	r.mutex.Unlock()
+
+	// 3. Transmit to all viewers
+	for _, client := range targets {
+		err := client.WriteMessage(websocket.BinaryMessage, message)
+		if err != nil {
+			log.Printf("Error broadcasting screen in room %s: %v", r.id, err)
+
+			// Close the dead connection; the caller's deferred RemoveScreenViewer will
+			// handle removing it from the viewer map and idle timer logic.
+			client.Close()
 		}
 	}
 }

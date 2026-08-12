@@ -9,7 +9,8 @@ import (
 )
 
 var upgrader = websocket.Upgrader{
-	// @TODO Temp allow anything
+	// Allow connections from any origin — authentication is handled via room tokens
+	// and API keys, so origin checking is unnecessary for this microservice.
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
@@ -30,12 +31,18 @@ func main() {
 		fmt.Printf("Server has APIKey and will require it to connect\n")
 	}
 
+	// --- REST API ---
 	http.HandleFunc("/api/rooms/create", manager.handleCreateRoomAPI)
 	http.HandleFunc("/api/rooms/check", manager.handleCheckRoomAPI)
+	http.HandleFunc("/api/rooms/update-token", manager.handleUpdateRoomTokenAPI)
+	http.HandleFunc("/api/rooms/remove", manager.handleRemoveRoomAPI)
 
-	// Inject the manager into our HTTP handler using a closure
+	// --- WebSocket endpoints ---
 	http.HandleFunc("/api/rooms/stream", func(w http.ResponseWriter, r *http.Request) {
 		handleAudioStream(manager, w, r)
+	})
+	http.HandleFunc("/api/rooms/screenshare", func(w http.ResponseWriter, r *http.Request) {
+		handleScreenShare(manager, w, r)
 	})
 
 	http.HandleFunc("/health", handleHealthCheck)

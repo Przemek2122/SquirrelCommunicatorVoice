@@ -1,4 +1,4 @@
-module SqiurrelVoice
+module SquirrelVoice
 
 go 1.25
 

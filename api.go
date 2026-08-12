@@ -13,16 +13,33 @@ type CreateRoomRequest struct {
 	Token  string `json:"token"`
 }
 
+type UpdateRoomTokenRequest struct {
+	RoomId string `json:"roomId"`
+	Token  string `json:"token"`
+}
+
+type RemoveRoomRequest struct {
+	RoomId string `json:"roomId"`
+}
+
+// writeJSONError sends a JSON-formatted error response.
+// All REST API errors use this for consistent Content-Type headers.
+func writeJSONError(w http.ResponseWriter, message string, statusCode int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	json.NewEncoder(w).Encode(map[string]string{"error": message})
+}
+
 func (rm *RoomManager) handleCreateRoomAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		writeJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	// Check token (Server should send auth)
 	clientToken := r.Header.Get("X-API-Token")
 	if clientToken != rm.APIKey {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		writeJSONError(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -30,13 +47,13 @@ func (rm *RoomManager) handleCreateRoomAPI(w http.ResponseWriter, r *http.Reques
 	var req CreateRoomRequest
 	err := json.NewDecoder(r.Body).Decode(&req)
 	if err != nil {
-		http.Error(w, "Incorrect JSON", http.StatusBadRequest)
+		writeJSONError(w, "Incorrect JSON", http.StatusBadRequest)
 		return
 	}
 
 	// Check if JSON has RoomId
 	if req.RoomId == "" {
-		http.Error(w, "Missing roomId", http.StatusBadRequest)
+		writeJSONError(w, "Missing roomId", http.StatusBadRequest)
 		return
 	}
 
@@ -54,22 +71,118 @@ func (rm *RoomManager) handleCreateRoomAPI(w http.ResponseWriter, r *http.Reques
 	}
 }
 
+func (rm *RoomManager) handleUpdateRoomTokenAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		writeJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Check auth
+	clientToken := r.Header.Get("X-API-Token")
+	if clientToken != rm.APIKey {
+		writeJSONError(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Decode JSON
+	var req UpdateRoomTokenRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		writeJSONError(w, "Incorrect JSON", http.StatusBadRequest)
+		return
+	}
+
+	// Validate fields
+	if req.RoomId == "" {
+		writeJSONError(w, "Missing roomId", http.StatusBadRequest)
+		return
+	}
+	if req.Token == "" {
+		writeJSONError(w, "Missing token", http.StatusBadRequest)
+		return
+	}
+
+	// Attempt to update the token
+	updated := rm.UpdateRoomToken(req.RoomId, req.Token)
+	if !updated {
+		writeJSONError(w, "Room not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	jeer := json.NewEncoder(w).Encode(map[string]interface{}{
+		"updated": true,
+		"roomId":  req.RoomId,
+	})
+	if jeer != nil {
+		return
+	}
+}
+
+func (rm *RoomManager) handleRemoveRoomAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		writeJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Check auth
+	clientToken := r.Header.Get("X-API-Token")
+	if clientToken != rm.APIKey {
+		writeJSONError(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Decode JSON
+	var req RemoveRoomRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		writeJSONError(w, "Incorrect JSON", http.StatusBadRequest)
+		return
+	}
+
+	// Validate fields
+	if req.RoomId == "" {
+		writeJSONError(w, "Missing roomId", http.StatusBadRequest)
+		return
+	}
+
+	// Attempt to remove the room
+	removed := rm.RemoveRoom(req.RoomId)
+	if !removed {
+		writeJSONError(w, "Room not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	jeer := json.NewEncoder(w).Encode(map[string]interface{}{
+		"removed": true,
+		"roomId":  req.RoomId,
+	})
+	if jeer != nil {
+		return
+	}
+}
+
 func (rm *RoomManager) handleCheckRoomAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		writeJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	// Check token (Server should send auth)
 	clientToken := r.Header.Get("X-API-Token")
 	if clientToken != rm.APIKey {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		writeJSONError(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
 	roomID := r.URL.Query().Get("room")
 	if roomID == "" {
-		http.Error(w, "Missing room name", http.StatusBadRequest)
+		writeJSONError(w, "Missing room name", http.StatusBadRequest)
 		return
 	}
 
@@ -89,7 +202,7 @@ func handleAudioStream(rm *RoomManager, w http.ResponseWriter, r *http.Request) 
 	roomID := r.URL.Query().Get("room")
 	if roomID == "" {
 		log.Println("Missing room name")
-		http.Error(w, "Missing room name", http.StatusNotFound)
+		writeJSONError(w, "Missing room name", http.StatusBadRequest)
 		return
 	}
 
@@ -97,7 +210,7 @@ func handleAudioStream(rm *RoomManager, w http.ResponseWriter, r *http.Request) 
 	userId := r.URL.Query().Get("userid")
 	if userId == "" {
 		log.Println("Missing room userid")
-		http.Error(w, "Missing room userid", http.StatusNotFound)
+		writeJSONError(w, "Missing room userid", http.StatusBadRequest)
 		return
 	}
 
@@ -105,7 +218,7 @@ func handleAudioStream(rm *RoomManager, w http.ResponseWriter, r *http.Request) 
 	token := r.URL.Query().Get("token")
 	if token == "" {
 		log.Println("Missing room token")
-		http.Error(w, "Missing room token", http.StatusUnauthorized)
+		writeJSONError(w, "Missing room token", http.StatusUnauthorized)
 		return
 	}
 
@@ -120,7 +233,9 @@ func handleAudioStream(rm *RoomManager, w http.ResponseWriter, r *http.Request) 
 	room := rm.JoinRoom(roomID, token, userId, conn)
 
 	if room == nil {
-		w.WriteHeader(http.StatusNotFound)
+		// Upgrade already happened — send close frame with meaningful message
+		conn.WriteMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Room not found or invalid token"))
 		return
 	}
 
@@ -145,7 +260,7 @@ func handleAudioStream(rm *RoomManager, w http.ResponseWriter, r *http.Request) 
 func handleHealthCheck(w http.ResponseWriter, r *http.Request) {
 	// We only want to allow GET requests here
 	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		writeJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
