@@ -185,10 +185,10 @@ ws://host/api/rooms/stream?room=X&userid=Y&token=Z
 The server uses a **custom binary framing** so receivers can identify which user sent each audio chunk:
 
 ```
-┌──────────────┬──────────────┬─────────────────────┐
+┌──────────────┬──────────┬─────────────────────┐
 │  ID Length   │   ID Bytes   │   WebM Audio Chunk  │
 │   (1 byte)   │  (1–255 B)   │     (variable)       │
-└──────────────┴──────────────┴─────────────────────┘
+└──────────────┴──────────┴─────────────────────┘
 ```
 
 | Segment       | Size       | Description                                      |
@@ -288,7 +288,9 @@ ws://host/api/rooms/screenshare?room=X&userid=Y&token=Z&role=publisher|viewer
 
 - **Viewer** — Receives raw `video/webm` binary frames pushed by the publisher. On join, the viewer is immediately sent the cached WebM initialization segment (if available) so they can decode the ongoing stream without waiting for the next keyframe.
 
-- **Init segment caching** — The server detects WebM EBML magic bytes (`0x1A 0x45 0xDF 0xA3`) and caches the first such chunk as the init segment. Late-joining viewers receive this immediately.
+- **Init segment caching** — The server scans the leading bytes of each publisher message for the WebM EBML magic bytes (`0x1A 0x45 0xDF 0xA3`), looking anywhere within the first 4 KB (not only at offset 0), and caches the first such chunk as the init segment. Late-joining viewers receive this immediately.
+
+- **Exactly-once init delivery** — Init caching, per-viewer "already served" tracking, and viewer registration all happen under the same room mutex. This guarantees each viewer receives exactly **one** init segment — a duplicate init would corrupt the browser's `SourceBuffer`.
 
 - **Publisher disconnect** — When the publisher disconnects, **all viewers are forcibly disconnected**. This gives the frontend a clean signal that the stream has ended.
 
@@ -344,7 +346,7 @@ mediaSource.addEventListener('sourceopen', () => {
                                       │
           ┌───────────────────────────┼───────────────────────────┐
           │                           │                           │
-    ┌─────▼─────┐          ┌──────────▼──────────┐          ┌─────▼─────┐
+    ┌─────▼─────┐          ┌──────────▼───────────┐          ┌─────▼─────┐
     │  REST API │          │ Audio WS            │          │ Screen WS │
     │  /create  │          │  /stream            │          │/screenshare│
     │  /check   │          │                     │          │           │
@@ -352,11 +354,11 @@ mediaSource.addEventListener('sourceopen', () => {
     │  /remove  │          │                     │          │           │
     └───────────┘          └──────────┬──────────┘          └─────┬─────┘
                                       │                           │
-                              ┌───────▼───────┐        ┌──────────▼──────────┐
+                              ┌───────▼───────┐        ┌──────────▼───────────┐
                               │   Room Map    │        │  Room Map           │
                               │  clients[]    │        │ publisher           │
                               │  initSegs[]   │        │ viewers[]           │
-                              └───────────────┘        └─────────────────────┘
+                              └───────┬───────┘        └──────────┬───────────┘
                                       │                           │
                               ┌───────▼───────┐                   │
                               │   Broadcast   │                   │

@@ -9,6 +9,330 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// WebM/EBML init segment magic bytes (1A 45 DF A3).
+const (
+	ebmlMagic0 = 0x1A
+	ebmlMagic1 = 0x45
+	ebmlMagic2 = 0xDF
+	ebmlMagic3 = 0xA3
+
+	// initScanWindow is how many leading bytes we scan when looking for the
+	// EBML magic. The init segment always begins with these bytes, so they are
+	// expected near the start of the first publisher message (some browsers may
+	// emit them at a small non-zero offset). Limiting the scan avoids false
+	// positives deep inside large media frames.
+	initScanWindow = 4096
+)
+
+// findInitOffset returns the byte offset of the EBML init magic within message,
+// or -1 if the magic is not found within the scan window.
+func findInitOffset(message []byte) int {
+	limit := len(message)
+	if limit > initScanWindow {
+		limit = initScanWindow
+	}
+	for i := 0; i+4 <= limit; i++ {
+		if message[i] == ebmlMagic0 &&
+			message[i+1] == ebmlMagic1 &&
+			message[i+2] == ebmlMagic2 &&
+			message[i+3] == ebmlMagic3 {
+			return i
+		}
+	}
+	return -1
+}
+
+// WebM element IDs (raw byte values; WebM IDs are at most 4 bytes).
+const (
+	webmIDEBML       = 0x1A45DFA3
+	webmIDSegment    = 0x18538067
+	webmIDTracks     = 0x1654AE6B
+	webmIDCluster    = 0x1F43B675
+	webmIDTrackEntry = 0xAE
+	webmIDCodecID    = 0x86
+)
+
+// readVint reads an EBML variable-length integer at pos. It returns the number
+// of bytes consumed, the decoded value, whether it encodes EBML's "unknown
+// size" (all value bits set), and whether it was valid/complete.
+func readVint(data []byte, pos int) (length int, value uint64, unknown bool, ok bool) {
+	if pos >= len(data) {
+		return 0, 0, false, false
+	}
+	first := data[pos]
+	var l int
+	switch {
+	case first&0x80 != 0:
+		l = 1
+	case first&0x40 != 0:
+		l = 2
+	case first&0x20 != 0:
+		l = 3
+	case first&0x10 != 0:
+		l = 4
+	case first&0x08 != 0:
+		l = 5
+	case first&0x04 != 0:
+		l = 6
+	case first&0x02 != 0:
+		l = 7
+	case first&0x01 != 0:
+		l = 8
+	default:
+		return 0, 0, false, false
+	}
+	if pos+l > len(data) {
+		return 0, 0, false, false
+	}
+
+	firstBits := 8 - l
+	var val uint64
+	val = uint64(first) & ((uint64(1) << uint(firstBits)) - 1)
+	for i := 1; i < l; i++ {
+		val = (val << 8) | uint64(data[pos+i])
+	}
+
+	// Unknown size: every value bit is 1.
+	unknown = true
+	firstMask := uint64(0xFF) >> uint(l)
+	if uint64(first)&firstMask != firstMask {
+		unknown = false
+	}
+	for i := 1; i < l && unknown; i++ {
+		if data[pos+i] != 0xFF {
+			unknown = false
+		}
+	}
+
+	return l, val, unknown, true
+}
+
+// readID reads a WebM element ID (a VINT of at most 4 bytes) and returns its
+// raw bytes as an unsigned integer plus the number of bytes consumed.
+func readID(data []byte, pos int) (length int, id uint32, ok bool) {
+	if pos >= len(data) {
+		return 0, 0, false
+	}
+	first := data[pos]
+	var l int
+	switch {
+	case first&0x80 != 0:
+		l = 1
+	case first&0x40 != 0:
+		l = 2
+	case first&0x20 != 0:
+		l = 3
+	case first&0x10 != 0:
+		l = 4
+	default:
+		return 0, 0, false // WebM IDs are at most 4 bytes
+	}
+	if pos+l > len(data) {
+		return 0, 0, false
+	}
+	var idv uint32
+	for i := 0; i < l; i++ {
+		idv = (idv << 8) | uint32(data[pos+i])
+	}
+	return l, idv, true
+}
+
+// parseWebMInit walks the EBML structure of an accumulated buffer and locates
+// the init/media boundary. It returns:
+//
+//	complete - true when the init (EBML + Segment + Info + Tracks) is fully
+//	           contained in the buffer.
+//	codec    - the raw CodecID string (e.g. "V_VP8") or "".
+//	initEnd  - byte offset where media (the first Cluster) begins; when no
+//	           Cluster is present yet this is the end of the parsed init.
+//
+// It returns complete=false when an element extends past the end of the buffer
+// (the init is still truncated) and the caller must keep accumulating.
+func parseWebMInit(data []byte) (complete bool, codec string, initEnd int) {
+	n := len(data)
+	pos := 0
+
+	// 1. EBML header.
+	l, id, ok := readID(data, pos)
+	if !ok || id != webmIDEBML {
+		return false, "", 0
+	}
+	pos += l
+	l, sz, unk, ok := readVint(data, pos)
+	if !ok || unk {
+		return false, "", 0
+	}
+	pos += l
+	if sz > uint64(n) {
+		return false, "", 0
+	}
+	ebmlEnd := pos + int(sz)
+	if ebmlEnd > n {
+		return false, "", 0
+	}
+	pos = ebmlEnd
+
+	// 2. Segment.
+	l, id, ok = readID(data, pos)
+	if !ok || id != webmIDSegment {
+		return false, "", 0
+	}
+	pos += l
+	l, sz, unk, ok = readVint(data, pos)
+	if !ok {
+		return false, "", 0
+	}
+	pos += l
+	// Segment size is usually "unknown" in a live stream; clamp to what we have
+	// received so far. If the declared size is larger than what we have, walk
+	// the bytes we DO have rather than bailing out (a complete init may still be
+	// fully contained within them).
+	segEnd := n
+	if !unk && sz <= uint64(n) && pos+int(sz) < n {
+		segEnd = pos + int(sz)
+	}
+
+	// 3. Walk Segment children until the first Cluster.
+	sawTracks := false
+	for pos < segEnd {
+		l, id, ok := readID(data, pos)
+		if !ok {
+			return false, "", 0
+		}
+		if id == webmIDCluster {
+			return true, codec, pos
+		}
+		pos += l
+		l, sz, unk, ok := readVint(data, pos)
+		if !ok {
+			return false, "", 0
+		}
+		pos += l
+		if unk {
+			if id == webmIDTracks {
+				codec = findCodecInTracks(data, pos, segEnd)
+				sawTracks = true
+			}
+			pos = segEnd
+			break
+		}
+		if sz > uint64(n) {
+			return false, "", 0
+		}
+		dataEnd := pos + int(sz)
+		if dataEnd > n {
+			return false, "", 0 // element extends past buffer -> truncated
+		}
+		if id == webmIDTracks {
+			codec = findCodecInTracks(data, pos, dataEnd)
+			sawTracks = true
+		}
+		pos = dataEnd
+	}
+
+	if sawTracks {
+		return true, codec, pos
+	}
+	return false, "", 0
+}
+
+// findCodecInTracks walks the children of a Tracks element and returns the
+// CodecID string of the first TrackEntry, or "".
+func findCodecInTracks(data []byte, start, end int) string {
+	pos := start
+	for pos < end {
+		l, id, ok := readID(data, pos)
+		if !ok {
+			return ""
+		}
+		if id == webmIDTrackEntry {
+			pos += l
+			l, sz, unk, ok := readVint(data, pos)
+			if !ok {
+				return ""
+			}
+			pos += l
+			teEnd := end
+			if !unk {
+				if sz > uint64(end) {
+					return ""
+				}
+				teEnd = pos + int(sz)
+				if teEnd > end {
+					return "" // TrackEntry truncated
+				}
+			}
+			if c := findCodecInTrackEntry(data, pos, teEnd); c != "" {
+				return c
+			}
+			pos = teEnd
+			continue
+		}
+		pos += l
+		l, sz, unk, ok := readVint(data, pos)
+		if !ok {
+			return ""
+		}
+		pos += l
+		if unk {
+			break
+		}
+		if sz > uint64(end) {
+			return ""
+		}
+		pos += int(sz)
+		if pos > end {
+			return ""
+		}
+	}
+	return ""
+}
+
+// findCodecInTrackEntry walks the children of a TrackEntry element and returns
+// the ASCII value of the CodecID element (0x86), or "".
+func findCodecInTrackEntry(data []byte, start, end int) string {
+	pos := start
+	for pos < end {
+		l, id, ok := readID(data, pos)
+		if !ok {
+			return ""
+		}
+		if id == webmIDCodecID {
+			pos += l
+			l, sz, unk, ok := readVint(data, pos)
+			if !ok || unk {
+				return ""
+			}
+			pos += l
+			if sz > uint64(end) {
+				return ""
+			}
+			codecEnd := pos + int(sz)
+			if codecEnd > end {
+				return "" // codec value truncated
+			}
+			return string(data[pos:codecEnd])
+		}
+		pos += l
+		l, sz, unk, ok := readVint(data, pos)
+		if !ok {
+			return ""
+		}
+		pos += l
+		if unk {
+			break
+		}
+		if sz > uint64(end) {
+			return ""
+		}
+		pos += int(sz)
+		if pos > end {
+			return ""
+		}
+	}
+	return ""
+}
+
 // Room represents a single channel with its own isolated state and mutex
 type Room struct {
 	id    string
@@ -28,6 +352,23 @@ type Room struct {
 	screenPublisher   *websocket.Conn            // Only one publisher per room
 	screenViewers     map[*websocket.Conn]string // Viewers receiving the screen stream
 	screenInitSegment []byte                     // Cached VP8/VP9 init segment for late joiners
+	screenInitBuffer  []byte                     // Accumulating publisher bytes until a COMPLETE init is found
+	screenInitReady   bool                       // true once screenInitSegment is a complete init
+
+	// screenInitPending tracks viewers whose init segment has NOT yet been
+	// delivered. Media frames must never reach a viewer before its init, so
+	// BroadcastScreen skips any viewer still marked here; the mark is cleared
+	// once the init has actually been written to that viewer.
+	screenInitPending map[*websocket.Conn]bool
+
+	// screenWriteMu serializes ALL writes to screen viewer connections.
+	//
+	// Without this, the one-time init write in handleScreenViewer can race a
+	// media write from the publisher's BroadcastScreen goroutine on the SAME
+	// *websocket.Conn. gorilla/websocket panics with
+	// "concurrent write to websocket connection" when two goroutines write at
+	// once, so every screen write must go through this mutex.
+	screenWriteMu sync.Mutex
 }
 
 // RoomManager holds the state of the entire microservice
@@ -63,11 +404,12 @@ func (rm *RoomManager) CreateRoom(roomID string, token string) *Room {
 	}
 
 	room := &Room{
-		id:            roomID,
-		token:         token,
-		clients:       make(map[*websocket.Conn]string),
-		initSegments:  make(map[*websocket.Conn][]byte),
-		screenViewers: make(map[*websocket.Conn]string),
+		id:                roomID,
+		token:             token,
+		clients:           make(map[*websocket.Conn]string),
+		initSegments:      make(map[*websocket.Conn][]byte),
+		screenViewers:     make(map[*websocket.Conn]string),
+		screenInitPending: make(map[*websocket.Conn]bool),
 	}
 	rm.rooms[roomID] = room
 
@@ -132,6 +474,9 @@ func (rm *RoomManager) RemoveRoom(roomID string) bool {
 	room.screenPublisher = nil
 	room.screenViewers = make(map[*websocket.Conn]string)
 	room.screenInitSegment = nil
+	room.screenInitBuffer = nil
+	room.screenInitReady = false
+	room.screenInitPending = make(map[*websocket.Conn]bool)
 	totalClients := len(allConns)
 	room.mutex.Unlock()
 
@@ -170,29 +515,39 @@ func (rm *RoomManager) JoinRoom(roomID string, token string, userId string, conn
 		return nil
 	}
 
-	// Lock the specific room and add the client
+	// 1. Snapshot the cached init segments under the room lock WITHOUT mutating
+	// room state. The client is NOT yet registered as a broadcast target, so a
+	// concurrent Broadcast() cannot deliver a mid-stream media frame before this
+	// init (the old ordering raced with Broadcast and could corrupt the
+	// receiver's stream). We deliberately do NOT stop the idle timer here: if
+	// the init write below fails and we bail out, the room must remain able to
+	// be destroyed when empty (stopping it here would leak the room).
 	room.mutex.Lock()
-	room.idleTimer.Stop()
-	room.clients[conn] = userId
-
-	// 2. Fast copy
 	var chunksToSend [][]byte
 	for _, initChunk := range room.initSegments {
 		chunksToSend = append(chunksToSend, initChunk)
 	}
-
 	room.mutex.Unlock()
 
-	fmt.Printf("Client joined room [%s]. Total clients in room: %d\n", roomID, len(room.clients))
-
-	// 4. Send packages without mutex locked
+	// 2. Send init segments BEFORE registering the client as a target. This
+	// guarantees init-before-media for late joiners.
 	for _, chunk := range chunksToSend {
 		err := conn.WriteMessage(websocket.BinaryMessage, chunk)
 		if err != nil {
 			fmt.Printf("Error sending init segment: %v\n", err)
-			break
+			return nil
 		}
 	}
+
+	// 3. Now register the client as a broadcast target and stop the idle timer,
+	// atomically under the room lock. Only at this point is the room considered
+	// active again, so the timer is never left stopped on a failed join.
+	room.mutex.Lock()
+	room.idleTimer.Stop()
+	room.clients[conn] = userId
+	room.mutex.Unlock()
+
+	fmt.Printf("Client joined room [%s]. Total clients in room: %d\n", roomID, len(room.clients))
 
 	return room
 }
@@ -331,8 +686,13 @@ func (r *Room) Broadcast(sender *websocket.Conn, message []byte) {
 		if err != nil {
 			log.Printf("Error broadcasting to a client in room %s: %v", r.id, err)
 
-			// Close the dead connection; the caller's deferred LeaveRoom will
-			// handle removing it from the room's client map and idle timer logic.
+			// Remove the dead connection immediately so we stop trying to write
+			// to it on every broadcast. The caller's deferred LeaveRoom will
+			// still fire, but the delete here is idempotent and keeps the map
+			// accurate for clients whose read loop has not yet noticed the drop.
+			r.mutex.Lock()
+			delete(r.clients, client)
+			r.mutex.Unlock()
 			client.Close()
 		}
 	}
@@ -367,6 +727,9 @@ func (r *Room) ClearScreenPublisher(conn *websocket.Conn) []*websocket.Conn {
 
 	r.screenPublisher = nil
 	r.screenInitSegment = nil
+	r.screenInitBuffer = nil
+	r.screenInitReady = false
+	r.screenInitPending = make(map[*websocket.Conn]bool)
 
 	// Collect all viewer connections to close them outside the lock
 	viewers := make([]*websocket.Conn, 0, len(r.screenViewers))
@@ -380,14 +743,40 @@ func (r *Room) ClearScreenPublisher(conn *websocket.Conn) []*websocket.Conn {
 	return viewers
 }
 
-// AddScreenViewer registers a connection as a screen viewer and stops the idle timer.
-func (r *Room) AddScreenViewer(conn *websocket.Conn, userId string) {
+// RegisterScreenViewer atomically adds a viewer and returns the cached init
+// segment to send to it first (nil if there is no init yet). The viewer is
+// marked as "init pending" so BroadcastScreen will NOT relay media to it until
+// the init has actually been delivered (see MarkScreenInitDelivered). This
+// guarantees a viewer never receives media before its init segment, which is
+// what previously corrupted the WebM decoder on the frontend.
+func (r *Room) RegisterScreenViewer(conn *websocket.Conn, userId string) []byte {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
 	r.screenViewers[conn] = userId
+	r.screenInitPending[conn] = true // gate media until init is delivered first
 	r.idleTimer.Stop()
 	fmt.Printf("Screen viewer [%s] joined room [%s]. Total viewers: %d\n", userId, r.id, len(r.screenViewers))
+
+	// No init cached yet — the publisher's first init frame will reach this
+	// viewer via BroadcastScreen's first-init broadcast path.
+	if r.screenInitSegment == nil {
+		return nil
+	}
+
+	initSeg := make([]byte, len(r.screenInitSegment))
+	copy(initSeg, r.screenInitSegment)
+	return initSeg
+}
+
+// MarkScreenInitDelivered clears the "init pending" gate for a viewer, allowing
+// BroadcastScreen to start relaying media frames to it. Must be called after
+// the init segment has been successfully written to the connection.
+func (r *Room) MarkScreenInitDelivered(conn *websocket.Conn) {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	delete(r.screenInitPending, conn)
 }
 
 // RemoveScreenViewer removes a screen viewer connection.
@@ -396,54 +785,131 @@ func (r *Room) RemoveScreenViewer(conn *websocket.Conn) {
 	defer r.mutex.Unlock()
 
 	delete(r.screenViewers, conn)
+	delete(r.screenInitPending, conn)
 	fmt.Printf("Screen viewer left room [%s]. Remaining viewers: %d\n", r.id, len(r.screenViewers))
 }
 
-// GetScreenInitSegment returns the cached screen init segment (or nil).
-// Safe to call without holding the mutex externally; we lock internally.
-func (r *Room) GetScreenInitSegment() []byte {
-	r.mutex.Lock()
-	defer r.mutex.Unlock()
-
-	if r.screenInitSegment == nil {
-		return nil
-	}
-	// Return a copy to avoid data races
-	seg := make([]byte, len(r.screenInitSegment))
-	copy(seg, r.screenInitSegment)
-	return seg
-}
-
-// BroadcastScreen sends a binary video message to all screen viewers (not the publisher).
-// Caches WebM initialization chunks for late-joining viewers.
+// BroadcastScreen sends a binary video message to all screen viewers (not the
+// publisher).
+//
+// It accumulates publisher bytes until a COMPLETE init segment can be extracted
+// using a real EBML element walker (everything up to the first Cluster element
+// at an element boundary), caches that for late joiners, and enforces
+// init-before-media ordering: media frames are only relayed to viewers whose
+// init has already been delivered.
 func (r *Room) BroadcastScreen(sender *websocket.Conn, message []byte) {
 	r.mutex.Lock()
 
-	// 1. Detect WebM EBML magic bytes — cache as init segment for late joiners
-	if len(message) >= 4 && message[0] == 0x1A && message[1] == 0x45 && message[2] == 0xDF && message[3] == 0xA3 {
-		r.screenInitSegment = make([]byte, len(message))
-		copy(r.screenInitSegment, message)
+	var completeInit []byte
+	var trailingMedia []byte
+
+	if !r.screenInitReady {
+		// A real init begins with the EBML magic at offset 0 (the publisher
+		// always sends it as the first chunk). We only start/restart
+		// accumulation when:
+		//   - we have not started accumulating yet, or
+		//   - the message itself begins with the EBML magic (a fresh/re-sent
+		//     init). Otherwise we treat the message as a continuation and append
+		//     it, so a false-positive match deep inside a media frame can never
+		//     discard an init that is already being accumulated.
+		startsWithEBML := len(message) >= 4 &&
+			message[0] == ebmlMagic0 &&
+			message[1] == ebmlMagic1 &&
+			message[2] == ebmlMagic2 &&
+			message[3] == ebmlMagic3
+
+		if len(r.screenInitBuffer) == 0 {
+			// First accumulation: locate the magic (allow a small junk prefix).
+			if offset := findInitOffset(message); offset >= 0 {
+				r.screenInitBuffer = append([]byte(nil), message[offset:]...)
+			}
+		} else if startsWithEBML {
+			// Fresh/re-sent init: restart accumulation from offset 0.
+			r.screenInitBuffer = append([]byte(nil), message...)
+		} else {
+			// Continuation of the current init.
+			r.screenInitBuffer = append(r.screenInitBuffer, message...)
+		}
+
+		if len(r.screenInitBuffer) > 0 {
+			if complete, codec, initEnd := parseWebMInit(r.screenInitBuffer); complete {
+				r.screenInitSegment = make([]byte, initEnd)
+				copy(r.screenInitSegment, r.screenInitBuffer[:initEnd])
+				if initEnd < len(r.screenInitBuffer) {
+					trailingMedia = append([]byte(nil), r.screenInitBuffer[initEnd:]...)
+				}
+				r.screenInitReady = true
+				r.screenInitBuffer = nil
+				completeInit = r.screenInitSegment
+				log.Printf("screenshare init cached: room=%s bytes=%d codec=%s", r.id, len(r.screenInitSegment), codec)
+			} else if len(r.screenInitBuffer) > 1<<20 {
+				// Safety valve: 1MB accumulated without a complete init. The
+				// stream is undecodable; give up caching and relay raw frames
+				// (the publisher re-broadcasts its init every 2s, so viewers can
+				// still recover on their own).
+				r.screenInitReady = true
+				r.screenInitBuffer = nil
+				log.Printf("screenshare init never identified in room=%s -- relaying raw frames", r.id)
+			}
+		}
+
+		if !r.screenInitReady {
+			r.mutex.Unlock()
+			return
+		}
 	}
 
-	// 2. Fast copy of target viewers (exclude sender)
-	targets := make([]*websocket.Conn, 0, len(r.screenViewers))
-	for client := range r.screenViewers {
-		if client != sender {
-			targets = append(targets, client)
+	// Build the ordered list of (connection, payload) writes under the room
+	// lock. The init payload is delivered to EVERY viewer and clears its
+	// init-pending gate; media payloads are delivered only to viewers whose gate
+	// is already clear (init delivered first).
+	type screenWrite struct {
+		conn *websocket.Conn
+		data []byte
+	}
+	var writes []screenWrite
+	if completeInit != nil {
+		for client := range r.screenViewers {
+			if client == sender {
+				continue
+			}
+			writes = append(writes, screenWrite{client, completeInit})
+			delete(r.screenInitPending, client)
+		}
+		if len(trailingMedia) > 0 {
+			for client := range r.screenViewers {
+				if client == sender {
+					continue
+				}
+				writes = append(writes, screenWrite{client, trailingMedia})
+			}
+		}
+	} else {
+		for client := range r.screenViewers {
+			if client == sender {
+				continue
+			}
+			if !r.screenInitPending[client] {
+				writes = append(writes, screenWrite{client, message})
+			}
 		}
 	}
 
 	r.mutex.Unlock()
 
-	// 3. Transmit to all viewers
-	for _, client := range targets {
-		err := client.WriteMessage(websocket.BinaryMessage, message)
+	// Transmit. Writes are serialized through screenWriteMu so they can never
+	// race the one-time init write in handleScreenViewer on the same connection
+	// (gorilla/websocket panics on concurrent writes).
+	r.screenWriteMu.Lock()
+	defer r.screenWriteMu.Unlock()
+	for _, w := range writes {
+		err := w.conn.WriteMessage(websocket.BinaryMessage, w.data)
 		if err != nil {
 			log.Printf("Error broadcasting screen in room %s: %v", r.id, err)
 
-			// Close the dead connection; the caller's deferred RemoveScreenViewer will
-			// handle removing it from the viewer map and idle timer logic.
-			client.Close()
+			// Close the dead connection; the caller's deferred RemoveScreenViewer
+			// will handle removing it from the viewer map and idle timer logic.
+			w.conn.Close()
 		}
 	}
 }
