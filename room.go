@@ -140,14 +140,16 @@ func readID(data []byte, pos int) (length int, id uint32, ok bool) {
 // parseWebMInit walks the EBML structure of an accumulated buffer and locates
 // the init/media boundary. It returns:
 //
-//	complete - true when the init (EBML + Segment + Info + Tracks) is fully
-//	           contained in the buffer.
+//	complete - true only when the first Cluster element is reached and a codec
+//	           was already found in Tracks. Everything before that Cluster is a
+//	           complete init (EBML + Segment + Info + Tracks).
 //	codec    - the raw CodecID string (e.g. "V_VP8") or "".
-//	initEnd  - byte offset where media (the first Cluster) begins; when no
-//	           Cluster is present yet this is the end of the parsed init.
+//	initEnd  - byte offset where media (the first Cluster) begins.
 //
-// It returns complete=false when an element extends past the end of the buffer
-// (the init is still truncated) and the caller must keep accumulating.
+// A complete init is confirmed ONLY at a Cluster boundary. Without one the
+// buffer may still be a truncated init (the codec string can appear before the
+// rest of the Tracks element, e.g. the Video sub-element), so we return
+// complete=false and the caller must keep accumulating.
 func parseWebMInit(data []byte) (complete bool, codec string, initEnd int) {
 	n := len(data)
 	pos := 0
@@ -193,14 +195,21 @@ func parseWebMInit(data []byte) (complete bool, codec string, initEnd int) {
 	}
 
 	// 3. Walk Segment children until the first Cluster.
-	sawTracks := false
 	for pos < segEnd {
 		l, id, ok := readID(data, pos)
 		if !ok {
 			return false, "", 0
 		}
 		if id == webmIDCluster {
-			return true, codec, pos
+			// Reaching the first Cluster marks the end of the init, but a
+			// decodable init must have a codec (found in the Tracks element).
+			// Without one, this is not a usable init segment — do NOT report
+			// it complete, or we'll cache + broadcast a codec-less init that
+			// the viewer can never decode.
+			if codec != "" {
+				return true, codec, pos
+			}
+			return false, "", 0
 		}
 		pos += l
 		l, sz, unk, ok := readVint(data, pos)
@@ -211,7 +220,6 @@ func parseWebMInit(data []byte) (complete bool, codec string, initEnd int) {
 		if unk {
 			if id == webmIDTracks {
 				codec = findCodecInTracks(data, pos, segEnd)
-				sawTracks = true
 			}
 			pos = segEnd
 			break
@@ -225,14 +233,14 @@ func parseWebMInit(data []byte) (complete bool, codec string, initEnd int) {
 		}
 		if id == webmIDTracks {
 			codec = findCodecInTracks(data, pos, dataEnd)
-			sawTracks = true
 		}
 		pos = dataEnd
 	}
 
-	if sawTracks {
-		return true, codec, pos
-	}
+	// Reaching the end of the buffer without a Cluster means the init is still
+	// truncated or split across messages. We never report a codec-only buffer as
+	// complete -- doing so would cache a truncated init (missing the Video
+	// sub-element for video tracks) that the viewer's SourceBuffer rejects.
 	return false, "", 0
 }
 
@@ -369,6 +377,15 @@ type Room struct {
 	// "concurrent write to websocket connection" when two goroutines write at
 	// once, so every screen write must go through this mutex.
 	screenWriteMu sync.Mutex
+
+	// audioWriteMu serializes ALL writes to audio client connections, for
+	// the same reason as screenWriteMu: two different senders' Broadcast
+	// goroutines can target the SAME *websocket.Conn at once (two people
+	// speaking, or a user rejoining while another is mid-stream), and
+	// gorilla/websocket panics with "concurrent write to websocket
+	// connection" on concurrent writes. The screen path is protected by
+	// screenWriteMu; the audio path was not.
+	audioWriteMu sync.Mutex
 }
 
 // RoomManager holds the state of the entire microservice
@@ -509,8 +526,12 @@ func (rm *RoomManager) JoinRoom(roomID string, token string, userId string, conn
 		return nil
 	}
 
-	// Is token correct
-	if room.token != token {
+	// Is token correct. Read under the room lock — SetToken writes
+	// r.token under the same lock, so an unlocked read here is a data race.
+	room.mutex.Lock()
+	tokenOK := room.token == token
+	room.mutex.Unlock()
+	if !tokenOK {
 		fmt.Printf("Tried to join room with incorrect token: %s", roomID)
 		return nil
 	}
@@ -588,7 +609,10 @@ func (rm *RoomManager) GetRoom(roomID string, token string) *Room {
 		return nil
 	}
 
-	if room.token != token {
+	room.mutex.Lock()
+	tokenOK := room.token == token
+	room.mutex.Unlock()
+	if !tokenOK {
 		fmt.Printf("Tried to join room with incorrect token: %s\n", roomID)
 		return nil
 	}
@@ -662,8 +686,15 @@ func (r *Room) Broadcast(sender *websocket.Conn, message []byte) {
 	finalMessage = append(finalMessage, message...)
 
 	// 3. Detect WebM EBML magic bytes (0x1A 0x45 0xDF 0xA3) in the ORIGINAL message.
-	// If it's an initialization chunk, cache the FINAL message (which includes the ID)
-	// so new clients joining later can properly decode this user's stream.
+	// If it's an initialization chunk, cache the FINAL message (init + trailing
+	// media) so new clients joining later can properly decode this user's stream.
+	//
+	// We deliberately cache the ENTIRE first chunk rather than a stripped "pure
+	// init". Appending a pure init (with no following Cluster) to a SourceBuffer
+	// in 'sequence' mode made Chrome fire a SourceBuffer error and transition the
+	// MediaSource to 'ended' (this made audio fail on EVERY join). Appending the
+	// init together with the first media is what Chrome accepts, and 'sequence'
+	// append mode handles timestamp continuity for the trailing media.
 	if len(message) >= 4 && message[0] == 0x1A && message[1] == 0x45 && message[2] == 0xDF && message[3] == 0xA3 {
 		r.initSegments[sender] = finalMessage
 	}
@@ -680,7 +711,14 @@ func (r *Room) Broadcast(sender *websocket.Conn, message []byte) {
 	// Release the lock immediately after state copy is done
 	r.mutex.Unlock()
 
-	// 5. Safely transmit the constructed package to all targeted clients
+	// 5. Safely transmit the constructed package to all targeted clients.
+	// Writes are serialized through audioWriteMu so two concurrent Broadcast
+	// calls (different senders) can never write to the SAME target connection
+	// at once — gorilla/websocket panics with "concurrent write to websocket
+	// connection" on concurrent writes (the screen path has screenWriteMu for
+	// exactly this reason; the audio path was missing the equivalent guard).
+	r.audioWriteMu.Lock()
+	defer r.audioWriteMu.Unlock()
 	for _, client := range targets {
 		err := client.WriteMessage(websocket.BinaryMessage, finalMessage)
 		if err != nil {
@@ -695,6 +733,37 @@ func (r *Room) Broadcast(sender *websocket.Conn, message []byte) {
 			r.mutex.Unlock()
 			client.Close()
 		}
+	}
+}
+
+// SendKeyframe sends the cached init segment for the given target user to the
+// requester connection. Used to recover a viewer whose SourceBuffer errored:
+// the frontend requests a fresh init ("request_keyframe") and we reply with the
+// cached init so it can re-seed. This matters because the audio init is only
+// sent once per recording session, so without this a viewer that rejects the
+// init has no way to recover.
+func (r *Room) SendKeyframe(requester *websocket.Conn, targetUserId string) {
+	r.mutex.Lock()
+	var initPayload []byte
+	for client, uid := range r.clients {
+		if uid == targetUserId {
+			if seg, ok := r.initSegments[client]; ok {
+				initPayload = make([]byte, len(seg))
+				copy(initPayload, seg)
+			}
+			break
+		}
+	}
+	r.mutex.Unlock()
+
+	if initPayload == nil {
+		return
+	}
+
+	r.audioWriteMu.Lock()
+	defer r.audioWriteMu.Unlock()
+	if err := requester.WriteMessage(websocket.BinaryMessage, initPayload); err != nil {
+		log.Printf("Error sending keyframe to client in room %s: %v", r.id, err)
 	}
 }
 
@@ -754,7 +823,14 @@ func (r *Room) RegisterScreenViewer(conn *websocket.Conn, userId string) []byte 
 	defer r.mutex.Unlock()
 
 	r.screenViewers[conn] = userId
-	r.screenInitPending[conn] = true // gate media until init is delivered first
+	// Gate media until an init is delivered first — but only when an init is
+	// actually available or still being assembled. After the 1MB "relay raw
+	// frames" fallback (screenInitReady == true but screenInitSegment == nil)
+	// there will never be an init, so leaving the viewer pending would starve
+	// it forever (BroadcastScreen would skip it on every media frame).
+	if r.screenInitSegment != nil || !r.screenInitReady {
+		r.screenInitPending[conn] = true
+	}
 	r.idleTimer.Stop()
 	fmt.Printf("Screen viewer [%s] joined room [%s]. Total viewers: %d\n", userId, r.id, len(r.screenViewers))
 
