@@ -201,10 +201,14 @@ The sender sends **only raw WebM chunks** — the server prepends the ID framing
 
 ### Init Segment Caching (Late-Join Support)
 
-- The server scans each message for **WebM EBML magic bytes** (`0x1A 0x45 0xDF 0xA3`).
-- When a new client joins the room, all previously cached init segments are sent to them immediately.
-- This allows late joiners to decode ongoing streams without waiting for the next keyframe.
-- Init segments are cached **per-client**, clearing when that client disconnects.
+- Each sender's audio is relayed through a **Cluster-aligned feed** that only emits
+  complete WebM units: one keyframe (`EBML + Segment + Info + Tracks + FIRST complete
+  Cluster`) followed by complete Clusters.
+- The keyframe is cached **per sender** (keyed by connection). When a new client joins,
+  every cached keyframe is sent to them immediately, so a late joiner always starts with
+  `init + media` — never a bare init (which Chrome's MediaSource rejects with a fatal
+  SourceBuffer error) and never a mid-Cluster fragment.
+- Cached keyframes clear when that sender disconnects.
 
 ### Room Lifecycle
 
@@ -288,9 +292,23 @@ ws://host/api/rooms/screenshare?room=X&userid=Y&token=Z&role=publisher|viewer
 
 - **Viewer** — Receives raw `video/webm` binary frames pushed by the publisher. On join, the viewer is immediately sent the cached WebM initialization segment (if available) so they can decode the ongoing stream without waiting for the next keyframe.
 
-- **Init segment caching** — The server scans the leading bytes of each publisher message for the WebM EBML magic bytes (`0x1A 0x45 0xDF 0xA3`), looking anywhere within the first 4 KB (not only at offset 0), and caches the first such chunk as the init segment. Late-joining viewers receive this immediately.
+- **Init segment caching** — The publisher's raw WebM is relayed through a
+  **Cluster-aligned feed**: the server emits one keyframe (`init + first complete
+  Cluster`) and then complete Clusters. The keyframe is cached and sent to late-joining
+  viewers immediately, so they never receive a bare init or a mid-Cluster fragment.
 
-- **Exactly-once init delivery** — Init caching, per-viewer "already served" tracking, and viewer registration all happen under the same room mutex. This guarantees each viewer receives exactly **one** init segment — a duplicate init would corrupt the browser's `SourceBuffer`.
+- **Exactly-once init delivery** — Keyframe caching, the per-viewer "init pending" gate, and viewer registration all happen under the same room mutex. This guarantees each viewer receives exactly **one** keyframe before any media Cluster — a duplicate init would corrupt the browser's `SourceBuffer`.
+
+- **Duplicate init protection** — The server drops any WebSocket binary message that
+  starts with the EBML magic (`0x1A 0x45 0xDF 0xA3`) once the publisher's relay is
+  active. The publisher emits its init exactly once; any later EBML header is a
+  client re-broadcast that would otherwise be concatenated onto a Cluster and
+  emitted as one corrupt unit.
+
+- **Viewer recovery (`request_keyframe`)** — A viewer whose `SourceBuffer` fails and
+  is rebuilt sends `{"type":"request_keyframe"}` as a WebSocket text message. The
+  server replies with the cached keyframe (init + first complete Cluster) so the
+  viewer can re-seed its `MediaSource` without waiting for a new publisher.
 
 - **Publisher disconnect** — When the publisher disconnects, **all viewers are forcibly disconnected**. This gives the frontend a clean signal that the stream has ended.
 

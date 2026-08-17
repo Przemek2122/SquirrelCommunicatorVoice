@@ -242,31 +242,35 @@ func handleAudioStream(rm *RoomManager, w http.ResponseWriter, r *http.Request) 
 	// 2. Ensure the client is removed when they disconnect
 	defer rm.LeaveRoom(roomID, conn)
 
-	// 3. Infinite loop to listen for audio chunks / control messages
+	// 3. Infinite loop to listen for audio chunks
 	for {
 		messageType, message, err := conn.ReadMessage()
 		if err != nil {
 			break
 		}
 
-		// Control messages (JSON). The frontend sends
-		// {"type":"request_keyframe","target_user_id":"N"} to recover a remote
-		// player whose SourceBuffer errored on the init segment. We reply with
-		// that user's cached init so the player can re-seed.
-		if messageType == websocket.TextMessage {
-			var req struct {
-				Type         string `json:"type"`
-				TargetUserID string `json:"target_user_id"`
-			}
-			if err := json.Unmarshal(message, &req); err == nil && req.Type == "request_keyframe" {
-				room.SendKeyframe(conn, req.TargetUserID)
-			}
-			continue
-		}
-
 		// 4. Broadcast logic delegated to the Room struct
 		if messageType == websocket.BinaryMessage {
 			room.Broadcast(conn, message)
+			continue
+		}
+
+		// 5. Control messages (JSON text). The frontend sends
+		//    {"type":"request_keyframe","target_user_id":"N"} when a remote
+		//    player's SourceBuffer fails and is rebuilt, asking us to re-send
+		//    that user's cached init segment (which is otherwise only sent once
+		//    on join).
+		if messageType == websocket.TextMessage {
+			var ctrl struct {
+				Type         string `json:"type"`
+				TargetUserID string `json:"target_user_id"`
+			}
+			if err := json.Unmarshal(message, &ctrl); err != nil {
+				continue
+			}
+			if ctrl.Type == "request_keyframe" && ctrl.TargetUserID != "" {
+				room.SendKeyframe(conn, ctrl.TargetUserID)
+			}
 		}
 	}
 }

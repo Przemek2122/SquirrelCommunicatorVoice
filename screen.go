@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"log"
 	"net/http"
 
@@ -141,12 +142,25 @@ func handleScreenViewer(rm *RoomManager, room *Room, conn *websocket.Conn, userI
 		room.MarkScreenInitDelivered(conn)
 	}
 
-	// Block on reads to detect disconnects (screen frames are pushed via WriteMessage by the publisher)
+	// Block on reads to detect disconnects. The viewer may also send a
+	// {"type":"request_keyframe"} control message after rebuilding its
+	// MediaSource; we reply with the cached keyframe (init + first Cluster).
 	for {
-		_, _, err := conn.ReadMessage()
+		messageType, message, err := conn.ReadMessage()
 		if err != nil {
 			log.Printf("[screen] Viewer [%s] disconnected from room [%s]: %v\n", userId, roomID, err)
 			break
+		}
+		if messageType == websocket.TextMessage {
+			var ctrl struct {
+				Type string `json:"type"`
+			}
+			if json.Unmarshal(message, &ctrl) != nil {
+				continue
+			}
+			if ctrl.Type == "request_keyframe" {
+				room.SendScreenKeyframe(conn)
+			}
 		}
 	}
 }
