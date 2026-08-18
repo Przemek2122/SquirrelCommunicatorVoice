@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/gorilla/websocket"
+	"github.com/pion/webrtc/v4"
 )
 
 type CreateRoomRequest struct {
@@ -242,34 +243,63 @@ func handleAudioStream(rm *RoomManager, w http.ResponseWriter, r *http.Request) 
 	// 2. Ensure the client is removed when they disconnect
 	defer rm.LeaveRoom(roomID, conn)
 
-	// 3. Infinite loop to listen for audio chunks
+	// 3. Infinite loop to listen for audio chunks / WebRTC signaling
 	for {
 		messageType, message, err := conn.ReadMessage()
 		if err != nil {
 			break
 		}
 
-		// 4. Broadcast logic delegated to the Room struct
+		// 4. Broadcast logic delegated to the Room struct (MSE fallback path).
 		if messageType == websocket.BinaryMessage {
 			room.Broadcast(conn, message)
 			continue
 		}
 
-		// 5. Control messages (JSON text). The frontend sends
-		//    {"type":"request_keyframe","target_user_id":"N"} when a remote
-		//    player's SourceBuffer fails and is rebuilt, asking us to re-send
-		//    that user's cached init segment (which is otherwise only sent once
-		//    on join).
+		// 5. Control + WebRTC signaling messages (JSON text).
+		//
+		//    MSE fallback: {"type":"request_keyframe","target_user_id":"N"}
+		//    when a remote player's SourceBuffer fails and is rebuilt, asking us
+		//    to re-send that user's cached init segment.
+		//
+		//    SFU (WebRTC): the frontend announces {"type":"hello","mode":"sfu"},
+		//    sends its microphone as an upstream offer, answers downstream
+		//    offers (one per other participant), and trickles ICE.
 		if messageType == websocket.TextMessage {
 			var ctrl struct {
-				Type         string `json:"type"`
-				TargetUserID string `json:"target_user_id"`
+				Type         string                  `json:"type"`
+				Mode         string                  `json:"mode"`
+				SDP          string                  `json:"sdp"`
+				TargetUserID string                  `json:"target_userid"`
+				Candidate    webrtc.ICECandidateInit `json:"candidate"`
 			}
 			if err := json.Unmarshal(message, &ctrl); err != nil {
 				continue
 			}
-			if ctrl.Type == "request_keyframe" && ctrl.TargetUserID != "" {
-				room.SendKeyframe(conn, ctrl.TargetUserID)
+			switch ctrl.Type {
+			case "hello":
+				if ctrl.Mode == "sfu" {
+					room.EnsureVoiceSFU()
+				}
+			case "offer":
+				if ctrl.SDP != "" {
+					room.EnsureVoiceSFU()
+					room.VoiceSFUHandleOffer(conn, userId, ctrl.SDP)
+				}
+			case "answer":
+				if ctrl.SDP != "" && ctrl.TargetUserID != "" {
+					room.VoiceSFUHandleAnswer(conn, ctrl.TargetUserID, ctrl.SDP)
+				}
+			case "ice":
+				if ctrl.TargetUserID != "" {
+					room.VoiceSFUHandleSubscriberICE(conn, ctrl.TargetUserID, ctrl.Candidate)
+				} else {
+					room.VoiceSFUHandleUpstreamICE(conn, userId, ctrl.Candidate)
+				}
+			case "request_keyframe":
+				if ctrl.TargetUserID != "" {
+					room.SendKeyframe(conn, ctrl.TargetUserID)
+				}
 			}
 		}
 	}

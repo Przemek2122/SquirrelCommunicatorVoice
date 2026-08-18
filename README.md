@@ -166,7 +166,17 @@ OK
 
 ## Voice Streaming (Audio)
 
-Real-time audio streaming over WebSocket. Multiple clients per room — each client sends their microphone audio and receives the mixed streams of all other participants.
+Real-time audio streaming. Multiple clients per room — each client sends
+their microphone audio and receives the streams of all other participants.
+
+> **Primary mode — SFU (WebRTC).** When participants support
+> `RTCPeerConnection`, the server acts as a **Selective Forwarding Unit** built
+> on [Pion WebRTC](https://github.com/pion/webrtc). Each participant publishes
+> **one** audio stream to the server, and the server forwards the RTP packets
+> (no decode/re-encode) to every other participant — sub-second latency, and
+> a participant's upload stays at **1× bitrate regardless of how many people
+> are listening**. The legacy `MediaRecorder → WebSocket → MediaSource` path
+> below remains only as an automatic fallback for browsers without WebRTC.
 
 ### Endpoint
 
@@ -288,7 +298,16 @@ ws://host/api/rooms/screenshare?room=X&userid=Y&token=Z&role=publisher|viewer
 
 ### How it works
 
-- **Publisher** — Exactly **one per room**. Sends raw WebM video binary frames (VP8/VP9) via WebSocket. All frames are broadcast to every viewer. If a second publisher tries to connect, they receive a JSON error and are rejected.
+> **Primary mode — SFU (WebRTC).** When both the publisher and viewers support
+> `RTCPeerConnection`, the server acts as a **Selective Forwarding Unit** built on
+> [Pion WebRTC](https://github.com/pion/webrtc). The publisher sends **one** stream
+> to the server, and the server forwards the RTP packets (no decode/re-encode) to
+> every viewer. This keeps the publisher's upload at **1× bitrate regardless of
+> the number of viewers**, adds only a few milliseconds of latency, and removes the
+> MediaRecorder/MSE backlog entirely. The legacy `MediaRecorder → WebSocket →
+> MediaSource` path below remains only as an automatic fallback.
+
+- **Publisher** — Exactly **one per room**. In MSE fallback mode it sends raw WebM video binary frames (VP8/VP9) via WebSocket. All frames are broadcast to every viewer. If a second publisher tries to connect, they receive a JSON error and are rejected.
 
 - **Viewer** — Receives raw `video/webm` binary frames pushed by the publisher. On join, the viewer is immediately sent the cached WebM initialization segment (if available) so they can decode the ongoing stream without waiting for the next keyframe.
 
@@ -386,8 +405,8 @@ mediaSource.addEventListener('sourceopen', () => {
 
 | Layer            | Audio                          | Screen Share                     |
 |------------------|--------------------------------|----------------------------------|
-| **Protocol**     | WebSocket binary               | WebSocket binary                 |
-| **Topology**     | Many-to-many (mesh)            | One-to-many (broadcast)          |
+| **Protocol**     | WebRTC (SFU) / WS binary fallback | WebSocket binary               |
+| **Topology**     | Many-to-many (SFU)             | One-to-many (broadcast)          |
 | **Framing**      | Custom: `[1B len][ID][chunk]`  | Raw WebM frames                  |
 | **Init caching** | Per-client (one per sender)    | Single (per-room)                |
 | **Late-join**    | All cached init segments sent  | Cached init segment sent         |
