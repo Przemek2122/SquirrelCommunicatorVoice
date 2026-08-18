@@ -90,9 +90,7 @@ func newScreenSFU(room *Room) (*ScreenSFU, error) {
 	})
 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateClosed {
-			log.Printf("[sfu] publisher connection state=%s in room %s", state, room.id)
-		}
+		log.Printf("[sfu] publisher connection state=%s in room %s", state, room.id)
 	})
 
 	return s, nil
@@ -169,6 +167,7 @@ func (s *ScreenSFU) onPublisherTrack(track *webrtc.TrackRemote) {
 func (s *ScreenSFU) relay(remote *webrtc.TrackRemote, local *webrtc.TrackLocalStaticRTP) {
 	buf := make([]byte, 1500)
 	pkt := &rtp.Packet{}
+	packets := 0
 	for {
 		n, _, err := remote.Read(buf)
 		if err != nil {
@@ -187,6 +186,10 @@ func (s *ScreenSFU) relay(remote *webrtc.TrackRemote, local *webrtc.TrackLocalSt
 			// One viewer may have failed; keep serving the others. The failed
 			// viewer is removed via its OnConnectionStateChange handler.
 			log.Printf("[sfu] relay write error in room %s: %v", s.room.id, err)
+		}
+		packets++
+		if packets == 1 {
+			log.Printf("[sfu] relay forwarding started in room %s (ssrc=%d pt=%d)", s.room.id, pkt.SSRC, pkt.PayloadType)
 		}
 	}
 }
@@ -283,7 +286,7 @@ func (s *ScreenSFU) sendOfferToViewer(conn *websocket.Conn, v *sfuViewer, localT
 		return
 	}
 	s.room.SendToScreenViewerConn(conn, data)
-	log.Printf("[sfu] offer sent to viewer in room %s", s.room.id)
+	log.Printf("[sfu] offer sent to viewer in room %s (codec=%s)", s.room.id, localTrack.Codec().MimeType)
 
 	// The offer is now on its way; flush any ICE candidates that were gathered
 	// while the offer was being created.
@@ -365,9 +368,15 @@ func (s *ScreenSFU) HandleViewerAnswer(conn *websocket.Conn, sdp string) {
 	}
 	if err := v.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: sdp}); err != nil {
 		log.Printf("[sfu] viewer SetRemoteDescription(answer) failed in room %s: %v", s.room.id, err)
-	} else {
-		log.Printf("[sfu] viewer answer applied in room %s", s.room.id)
+		return
 	}
+	log.Printf("[sfu] viewer answer applied in room %s", s.room.id)
+
+	// The viewer is now able to receive RTP. Ask the publisher for a keyframe so a
+	// mid-stream joiner immediately gets a decodable frame instead of waiting for
+	// the next periodic keyframe (VP8/VP9 delta frames alone are undecodable, and
+	// the PLI sent at track-arrival time races the viewer's answer + ICE setup).
+	s.requestKeyframe()
 }
 
 // HandleViewerICE adds a trickled ICE candidate from a viewer.
