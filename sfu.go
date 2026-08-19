@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/pion/rtcp"
@@ -38,6 +39,7 @@ type sfuViewer struct {
 // onto the server (which has the bandwidth for it).
 type ScreenSFU struct {
 	room  *Room
+	pub   *screenPublisher
 	mutex sync.Mutex
 
 	publisherPC *webrtc.PeerConnection
@@ -57,9 +59,10 @@ type ScreenSFU struct {
 // newScreenSFU creates the SFU and its publisher-side PeerConnection. The
 // publisher connects first; viewers can be added before or after the
 // publisher's track arrives (offers are deferred until the track is known).
-func newScreenSFU(room *Room) (*ScreenSFU, error) {
+func newScreenSFU(room *Room, pub *screenPublisher) (*ScreenSFU, error) {
 	s := &ScreenSFU{
 		room:    room,
+		pub:     pub,
 		viewers: make(map[*websocket.Conn]*sfuViewer),
 	}
 
@@ -91,6 +94,12 @@ func newScreenSFU(room *Room) (*ScreenSFU, error) {
 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		log.Printf("[sfu] publisher connection state=%s in room %s", state, room.id)
+		if state == webrtc.PeerConnectionStateConnected {
+			// The publisher sends its initial keyframe as soon as the connection
+			// is up, but if the first PLI was sent before ICE completed it was
+			// dropped. Request one now that the transport is ready.
+			s.requestKeyframe()
+		}
 	})
 
 	return s, nil
@@ -106,7 +115,7 @@ func (s *ScreenSFU) sendPublisherICE(candidate webrtc.ICECandidateInit) {
 	if err != nil {
 		return
 	}
-	s.room.SendToScreenPublisher(data)
+	s.pub.send(data)
 }
 
 // sendViewerICE serializes an ICE candidate for a viewer and sends it through
@@ -164,10 +173,20 @@ func (s *ScreenSFU) onPublisherTrack(track *webrtc.TrackRemote) {
 
 // relay reads RTP packets from the publisher and fans them out through the
 // shared local track. WriteRTP rewrites SSRC + payload type per viewer.
+//
+// It also runs a lightweight keyframe watchdog. A mid-stream joiner cannot
+// decode VP8/VP9/H264 until a keyframe arrives, and the keyframe request sent
+// at answer time races the viewer's ICE setup (the keyframe can be relayed
+// before the viewer is ready to receive and is then dropped). If no keyframe
+// has been forwarded within a short window, we re-request one so the viewer is
+// never stuck on a black screen.
 func (s *ScreenSFU) relay(remote *webrtc.TrackRemote, local *webrtc.TrackLocalStaticRTP) {
-	buf := make([]byte, 1500)
+	buf := make([]byte, 64<<10) // generous: RTP packets are MTU-sized, but this is safe
 	pkt := &rtp.Packet{}
+	mime := remote.Codec().MimeType
 	packets := 0
+	keyframes := 0
+	lastKeyframeReq := time.Now()
 	for {
 		n, _, err := remote.Read(buf)
 		if err != nil {
@@ -175,8 +194,9 @@ func (s *ScreenSFU) relay(remote *webrtc.TrackRemote, local *webrtc.TrackLocalSt
 			return
 		}
 		if err := pkt.Unmarshal(buf[:n]); err != nil {
-			log.Printf("[sfu] RTP unmarshal failed: %v", err)
-			return
+			// A single malformed packet should not kill the whole relay.
+			log.Printf("[sfu] RTP unmarshal failed in room %s: %v", s.room.id, err)
+			continue
 		}
 		// RTP header extension IDs differ between the publisher<->SFU and
 		// SFU<->viewer negotiations, so they must not be forwarded verbatim.
@@ -189,8 +209,57 @@ func (s *ScreenSFU) relay(remote *webrtc.TrackRemote, local *webrtc.TrackLocalSt
 		}
 		packets++
 		if packets == 1 {
-			log.Printf("[sfu] relay forwarding started in room %s (ssrc=%d pt=%d)", s.room.id, pkt.SSRC, pkt.PayloadType)
+			log.Printf("[sfu] relay forwarding started in room %s (codec=%s ssrc=%d pt=%d)", s.room.id, mime, pkt.SSRC, pkt.PayloadType)
 		}
+		if isKeyframePacket(pkt, mime) {
+			keyframes++
+			if keyframes == 1 {
+				log.Printf("[sfu] first keyframe relayed in room %s (codec=%s)", s.room.id, mime)
+			}
+		}
+		// Watchdog: if no keyframe has been forwarded yet, re-request one at
+		// most once per second. The first PLI (sent at track-arrival / answer
+		// time) can race the viewer's ICE setup and be dropped.
+		if keyframes == 0 && packets > 0 && time.Since(lastKeyframeReq) > time.Second {
+			lastKeyframeReq = time.Now()
+			s.requestKeyframe()
+		}
+	}
+}
+
+// isKeyframePacket reports whether an RTP packet carries a decodable keyframe
+// for the given negotiated MIME type. Used by the relay watchdog to know when a
+// viewer can actually start decoding.
+func isKeyframePacket(pkt *rtp.Packet, mime string) bool {
+	if pkt == nil || len(pkt.Payload) == 0 {
+		return false
+	}
+	switch mime {
+	case "video/VP8":
+		// VP8 payload descriptor: bit 0 of the first byte is the inverse
+		// keyframe flag (0 = keyframe).
+		return pkt.Payload[0]&0x01 == 0
+	case "video/H264":
+		nalType := pkt.Payload[0] & 0x1F
+		if nalType == 5 { // IDR
+			return true
+		}
+		// FU-A fragmentation: an IDR may be split across packets. The start
+		// fragment (S bit set) carries the real NAL type in the FU header.
+		if nalType == 28 && len(pkt.Payload) >= 2 &&
+			pkt.Payload[1]&0x80 != 0 && pkt.Payload[1]&0x1F == 5 {
+			return true
+		}
+		return false
+	case "video/VP9":
+		// VP9 payload descriptor: the "P" bit (bit 6 of the first octet) is set
+		// for inter-predicted frames; a keyframe has it clear.
+		if len(pkt.Payload) < 1 {
+			return false
+		}
+		return pkt.Payload[0]&0x40 == 0
+	default:
+		return false
 	}
 }
 
@@ -243,6 +312,12 @@ func (s *ScreenSFU) AddViewer(conn *websocket.Conn, userID string) {
 	})
 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		if state == webrtc.PeerConnectionStateConnected {
+			// The viewer can now receive RTP. Request a keyframe so a
+			// mid-stream joiner immediately gets a decodable frame (the
+			// keyframe request sent at answer time raced the ICE setup).
+			s.requestKeyframe()
+		}
 		if state == webrtc.PeerConnectionStateFailed ||
 			state == webrtc.PeerConnectionStateClosed ||
 			state == webrtc.PeerConnectionStateDisconnected {
@@ -330,7 +405,7 @@ func (s *ScreenSFU) HandlePublisherOffer(sdp string) {
 	if err != nil {
 		return
 	}
-	s.room.SendToScreenPublisher(data)
+	s.pub.send(data)
 	log.Printf("[sfu] publisher answer sent in room %s", s.room.id)
 
 	// The answer is now on its way; flush any ICE candidates that were gathered

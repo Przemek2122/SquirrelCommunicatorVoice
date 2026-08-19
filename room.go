@@ -159,6 +159,12 @@ func (f *webmRelay) feed(data []byte) (units [][]byte, keyframeFinalized bool) {
 	return units, keyframeFinalized
 }
 
+// maxScreenSharesPerRoom caps how many people can share their screen in a
+// single room at once. It is a hard limit (enforced atomically in
+// AddScreenPublisher) but configurable via the SQRLL_MAX_SCREENSHARES_PER_ROOM
+// env var, read at startup in main().
+var maxScreenSharesPerRoom = 5
+
 // Room represents a single channel with its own isolated state and mutex
 type Room struct {
 	id    string
@@ -178,20 +184,11 @@ type Room struct {
 	idleTimer *time.Timer
 
 	// --- Screen share fields ---
-	screenPublisher   *websocket.Conn            // Only one publisher per room
-	screenViewers     map[*websocket.Conn]string // Viewers receiving the screen stream
-	screenInitSegment []byte                     // Cached VP8/VP9 init segment for late joiners
-	screenInitBuffer  []byte                     // Accumulating publisher bytes until a COMPLETE init is found
-	screenRelay       *webmRelay                 // publisher's WebM Cluster-aligned relay
-	screenInitReady   bool                       // true once screenInitSegment is a complete init
-	screenInitHeader  []byte                     // init alone (no Cluster) for fresh keyframes
-	screenLastCluster []byte                     // most recent complete Cluster for fresh keyframes
-
-	// screenInitPending tracks viewers whose init segment has NOT yet been
-	// delivered. Media frames must never reach a viewer before its init, so
-	// BroadcastScreen skips any viewer still marked here; the mark is cleared
-	// once the init has actually been written to that viewer.
-	screenInitPending map[*websocket.Conn]bool
+	// screenPublishers maps each active screen publisher's connection to its
+	// per-publisher state. Multiple people may share their screen at once
+	// (Discord-style), each with its own relay / init cache / mode / SFU and
+	// its own set of viewers (a viewer picks one publisher via ?target=).
+	screenPublishers map[*websocket.Conn]*screenPublisher
 
 	// audioWriteMu serializes ALL writes to audio client connections.
 	//
@@ -210,25 +207,6 @@ type Room struct {
 	// "concurrent write to websocket connection" when two goroutines write at
 	// once, so every screen write must go through this mutex.
 	screenWriteMu sync.Mutex
-
-	// screenPublisherWriteMu serializes ALL writes to the screen publisher's
-	// connection. In WebRTC signaling mode multiple viewer read-loops each
-	// forward answer/ICE messages to the SAME publisher *websocket.Conn, so
-	// those writes must be serialized (gorilla/websocket panics on
-	// concurrent writes).
-	screenPublisherWriteMu sync.Mutex
-
-	// screenPublisherMode is the signaling mode the publisher announced via its
-	// "hello" message: "sfu" (server relays via Pion), "webrtc" (RTCPeerConnection
-	// mesh) or "mse" (the legacy MediaRecorder -> WebSocket -> MediaSource
-	// relay). Empty means "not yet announced", which is treated as "mse".
-	screenPublisherMode string
-
-	// screenSFU is the Pion-based Selective Forwarding Unit for the "sfu" mode.
-	// It relays the publisher's single upstream stream to every viewer so the
-	// publisher's upload stays at 1x bitrate regardless of viewer count.
-	// nil unless the publisher announced "sfu".
-	screenSFU *ScreenSFU
 
 	// voiceSFU is the Pion-based SFU for voice ("sfu" mode). It relays
 	// every participant's microphone to every other participant. nil unless
@@ -269,13 +247,12 @@ func (rm *RoomManager) CreateRoom(roomID string, token string) *Room {
 	}
 
 	room := &Room{
-		id:                roomID,
-		token:             token,
-		clients:           make(map[*websocket.Conn]string),
-		initSegments:      make(map[*websocket.Conn][]byte),
-		audioRelays:       make(map[*websocket.Conn]*webmRelay),
-		screenViewers:     make(map[*websocket.Conn]string),
-		screenInitPending: make(map[*websocket.Conn]bool),
+		id:               roomID,
+		token:            token,
+		clients:          make(map[*websocket.Conn]string),
+		initSegments:     make(map[*websocket.Conn][]byte),
+		audioRelays:      make(map[*websocket.Conn]*webmRelay),
+		screenPublishers: make(map[*websocket.Conn]*screenPublisher),
 	}
 	rm.rooms[roomID] = room
 
@@ -324,39 +301,32 @@ func (rm *RoomManager) RemoveRoom(roomID string) bool {
 
 	// Collect all connections under the room lock
 	room.mutex.Lock()
-	allConns := make([]*websocket.Conn, 0, len(room.clients)+len(room.screenViewers)+1)
+	allConns := make([]*websocket.Conn, 0, len(room.clients))
 	for conn := range room.clients {
 		allConns = append(allConns, conn)
 	}
-	if room.screenPublisher != nil {
-		allConns = append(allConns, room.screenPublisher)
-	}
-	for conn := range room.screenViewers {
-		allConns = append(allConns, conn)
+	var sfus []*ScreenSFU
+	for _, pub := range room.screenPublishers {
+		allConns = append(allConns, pub.conn)
+		for vConn := range pub.viewers {
+			allConns = append(allConns, vConn)
+		}
+		if pub.sfu != nil {
+			sfus = append(sfus, pub.sfu)
+		}
 	}
 	// Clear maps so deferred LeaveRoom / RemoveScreenViewer are harmless no-ops
 	room.clients = make(map[*websocket.Conn]string)
 	room.initSegments = make(map[*websocket.Conn][]byte)
 	room.audioRelays = make(map[*websocket.Conn]*webmRelay)
-	room.screenPublisher = nil
-	room.screenViewers = make(map[*websocket.Conn]string)
-	room.screenInitSegment = nil
-	room.screenInitBuffer = nil
-	room.screenRelay = nil
-	room.screenInitReady = false
-	room.screenInitHeader = nil
-	room.screenLastCluster = nil
-	room.screenPublisherMode = ""
-	room.screenInitPending = make(map[*websocket.Conn]bool)
-	sfu := room.screenSFU
-	room.screenSFU = nil
+	room.screenPublishers = make(map[*websocket.Conn]*screenPublisher)
 	vsfu := room.voiceSFU
 	room.voiceSFU = nil
 	totalClients := len(allConns)
 	room.mutex.Unlock()
 
 	// Close the SFUs (Pion PeerConnections) outside the room lock.
-	if sfu != nil {
+	for _, sfu := range sfus {
 		sfu.Close()
 	}
 	if vsfu != nil {
@@ -498,7 +468,7 @@ func (rm *RoomManager) DoesRoomExist(roomID string) bool {
 // isFullyEmpty checks if the room has NO participants of any kind (audio + screen).
 // Must be called with room.mutex held.
 func (r *Room) isFullyEmpty() bool {
-	return len(r.clients) == 0 && len(r.screenViewers) == 0 && r.screenPublisher == nil
+	return len(r.clients) == 0 && len(r.screenPublishers) == 0
 }
 
 // resetIdleIfEmpty starts the idle destruction timer if the room has zero participants.
@@ -661,181 +631,188 @@ func (r *Room) SendKeyframe(requester *websocket.Conn, targetUserID string) {
 
 // --- Screen Share Methods ---
 
-// SetScreenPublisher attempts to register a connection as the screen publisher.
-// Returns false if there's already an active publisher.
-func (r *Room) SetScreenPublisher(conn *websocket.Conn, userId string) bool {
+// screenPublisher tracks a single active screen sharer. Each publisher owns its
+// own relay / init cache / signaling mode / SFU and its own viewer set, so
+// multiple people can share their screen in the same voice channel at once.
+// A viewer connects to exactly one publisher via the ?target= query param.
+type screenPublisher struct {
+	conn        *websocket.Conn
+	userID      string
+	mode        string                     // "sfu", "webrtc" or "" (treated as "mse")
+	relay       *webmRelay                 // MSE Cluster-aligned relay
+	initSegment []byte                     // cached init + first Cluster (MSE late joiners)
+	initHeader  []byte                     // init alone (no Cluster) for fresh keyframes
+	lastCluster []byte                     // most recent complete Cluster for fresh keyframes
+	sfu         *ScreenSFU                 // Pion SFU for "sfu" mode (nil until announced)
+	writeMu     sync.Mutex                 // serialize writes to this publisher's conn
+	viewers     map[*websocket.Conn]string // viewer conn -> viewer user id
+	initPending map[*websocket.Conn]bool   // viewers whose init has not been delivered yet
+}
+
+// AddScreenPublisher registers a connection as a screen publisher. Any number
+// of publishers may share at once; each receives its own screenPublisher state.
+func (r *Room) AddScreenPublisher(conn *websocket.Conn, userId string) *screenPublisher {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
-	if r.screenPublisher != nil {
-		return false
-	}
-
-	r.screenPublisher = conn
-	r.idleTimer.Stop() // Room is active
-	fmt.Printf("Screen publisher [%s] started in room [%s]\n", userId, r.id)
-	return true
-}
-
-// ClearScreenPublisher removes the screen publisher and closes all viewer connections.
-func (r *Room) ClearScreenPublisher(conn *websocket.Conn) []*websocket.Conn {
-	r.mutex.Lock()
-
-	if r.screenPublisher != conn {
-		r.mutex.Unlock()
+	// Hard limit: reject a new publisher once the room is at capacity. This is
+	// enforced under the room lock so the count can never race two simultaneous
+	// publishers past the cap.
+	if len(r.screenPublishers) >= maxScreenSharesPerRoom {
+		fmt.Printf("Screen share limit (%d) reached in room [%s]; rejecting publisher [%s]\n", maxScreenSharesPerRoom, r.id, userId)
 		return nil
 	}
 
-	r.screenPublisher = nil
-	r.screenInitSegment = nil
-	r.screenInitBuffer = nil
-	r.screenRelay = nil
-	r.screenInitReady = false
-	r.screenInitHeader = nil
-	r.screenLastCluster = nil
-	r.screenPublisherMode = ""
-	r.screenInitPending = make(map[*websocket.Conn]bool)
+	pub := &screenPublisher{
+		conn:        conn,
+		userID:      userId,
+		viewers:     make(map[*websocket.Conn]string),
+		initPending: make(map[*websocket.Conn]bool),
+	}
+	r.screenPublishers[conn] = pub
+	r.idleTimer.Stop() // Room is active
+	fmt.Printf("Screen publisher [%s] started in room [%s] (publishers: %d)\n", userId, r.id, len(r.screenPublishers))
+	return pub
+}
 
-	// Collect all viewer connections to close them outside the lock
-	viewers := make([]*websocket.Conn, 0, len(r.screenViewers))
-	for vConn := range r.screenViewers {
+// getScreenPublisherByUserID returns the publisher registered for a user id, or nil.
+func (r *Room) getScreenPublisherByUserID(userID string) *screenPublisher {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	for _, pub := range r.screenPublishers {
+		if pub.userID == userID {
+			return pub
+		}
+	}
+	return nil
+}
+
+// ClearScreenPublisher removes a publisher and returns all of its viewer
+// connections (which the caller must close).
+func (r *Room) ClearScreenPublisher(pub *screenPublisher) []*websocket.Conn {
+	r.mutex.Lock()
+	if r.screenPublishers[pub.conn] != pub {
+		r.mutex.Unlock()
+		return nil
+	}
+	delete(r.screenPublishers, pub.conn)
+
+	viewers := make([]*websocket.Conn, 0, len(pub.viewers))
+	for vConn := range pub.viewers {
 		viewers = append(viewers, vConn)
 	}
-	// Clear the viewer map
-	r.screenViewers = make(map[*websocket.Conn]string)
+	pub.viewers = make(map[*websocket.Conn]string)
+	pub.initPending = make(map[*websocket.Conn]bool)
 
-	sfu := r.screenSFU
-	r.screenSFU = nil
+	sfu := pub.sfu
+	pub.sfu = nil
 	r.mutex.Unlock()
 
-	// Close the SFU (Pion PeerConnections) outside the room lock so ICE
-	// teardown does not block other room operations.
 	if sfu != nil {
 		sfu.Close()
 	}
 
-	fmt.Printf("Screen publisher left room [%s], %d viewers disconnected\n", r.id, len(viewers))
+	fmt.Printf("Screen publisher [%s] left room [%s], %d viewers disconnected\n", pub.userID, r.id, len(viewers))
 	return viewers
 }
 
-// RegisterScreenViewer atomically adds a viewer and returns the cached init
-// segment to send to it first (nil if there is no init yet). The viewer is
-// marked as "init pending" so BroadcastScreen will NOT relay media to it until
-// the init has actually been delivered (see MarkScreenInitDelivered). This
-// guarantees a viewer never receives media before its init segment, which is
-// what previously corrupted the WebM decoder on the frontend.
-func (r *Room) RegisterScreenViewer(conn *websocket.Conn, userId string) []byte {
+// CurrentScreenSharePublishers returns the user ids of all active publishers.
+func (r *Room) CurrentScreenSharePublishers() []string {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	ids := make([]string, 0, len(r.screenPublishers))
+	for _, pub := range r.screenPublishers {
+		ids = append(ids, pub.userID)
+	}
+	return ids
+}
+
+// RegisterScreenViewer atomically adds a viewer to a publisher and returns the
+// publisher's cached init segment to send first (nil if none yet). The viewer is
+// marked "init pending" so BroadcastScreen will not relay media to it until the
+// init has been delivered (see MarkScreenInitDelivered).
+func (r *Room) RegisterScreenViewer(pub *screenPublisher, conn *websocket.Conn, userId string) []byte {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
-	r.screenViewers[conn] = userId
-	r.screenInitPending[conn] = true // gate media until init is delivered first
+	pub.viewers[conn] = userId
+	pub.initPending[conn] = true
 	r.idleTimer.Stop()
-	fmt.Printf("Screen viewer [%s] joined room [%s]. Total viewers: %d\n", userId, r.id, len(r.screenViewers))
+	fmt.Printf("Screen viewer [%s] joined room [%s] for publisher [%s]. Viewers: %d\n", userId, r.id, pub.userID, len(pub.viewers))
 
-	// No init cached yet — the publisher's first init frame will reach this
-	// viewer via BroadcastScreen's first-init broadcast path.
-	if r.screenInitSegment == nil {
+	if pub.initSegment == nil {
 		return nil
 	}
 
-	// Prefer a FRESH keyframe (init + most recent complete Cluster) so a late
-	// joiner starts at the current screen instead of the stream's first frames.
-	if r.screenInitHeader != nil && r.screenLastCluster != nil {
-		initSeg := make([]byte, 0, len(r.screenInitHeader)+len(r.screenLastCluster))
-		initSeg = append(initSeg, r.screenInitHeader...)
-		initSeg = append(initSeg, r.screenLastCluster...)
+	if pub.initHeader != nil && pub.lastCluster != nil {
+		initSeg := make([]byte, 0, len(pub.initHeader)+len(pub.lastCluster))
+		initSeg = append(initSeg, pub.initHeader...)
+		initSeg = append(initSeg, pub.lastCluster...)
 		return initSeg
 	}
 
-	initSeg := make([]byte, len(r.screenInitSegment))
-	copy(initSeg, r.screenInitSegment)
+	initSeg := make([]byte, len(pub.initSegment))
+	copy(initSeg, pub.initSegment)
 	return initSeg
 }
 
-// MarkScreenInitDelivered clears the "init pending" gate for a viewer, allowing
-// BroadcastScreen to start relaying media frames to it. Must be called after
-// the init segment has been successfully written to the connection.
-func (r *Room) MarkScreenInitDelivered(conn *websocket.Conn) {
+// MarkScreenInitDelivered clears the "init pending" gate for a viewer.
+func (r *Room) MarkScreenInitDelivered(pub *screenPublisher, conn *websocket.Conn) {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
-
-	delete(r.screenInitPending, conn)
+	delete(pub.initPending, conn)
 }
 
-// RemoveScreenViewer removes a screen viewer connection.
-func (r *Room) RemoveScreenViewer(conn *websocket.Conn) {
+// RemoveScreenViewer removes a screen viewer connection from a publisher.
+func (r *Room) RemoveScreenViewer(pub *screenPublisher, conn *websocket.Conn) {
 	r.mutex.Lock()
-	userId := r.screenViewers[conn]
-	delete(r.screenViewers, conn)
-	delete(r.screenInitPending, conn)
-	remaining := len(r.screenViewers)
-	mode := r.screenPublisherMode
-	sfu := r.screenSFU
+	userId := pub.viewers[conn]
+	delete(pub.viewers, conn)
+	delete(pub.initPending, conn)
+	remaining := len(pub.viewers)
+	mode := pub.mode
+	sfu := pub.sfu
 	r.mutex.Unlock()
 
-	fmt.Printf("Screen viewer left room [%s]. Remaining viewers: %d\n", r.id, remaining)
+	fmt.Printf("Screen viewer left room [%s] for publisher [%s]. Remaining viewers: %d\n", r.id, pub.userID, remaining)
 
-	// SFU mode: drop this viewer's PeerConnection on the server.
 	if sfu != nil {
 		sfu.RemoveViewer(conn)
 	}
-
-	// Mesh mode: let the publisher close this viewer's RTCPeerConnection.
 	if mode != "sfu" && userId != "" {
-		r.NotifyViewerLeft(userId)
+		pub.notifyViewerLeft(userId)
 	}
 }
 
-// BroadcastScreen sends a binary video message to all screen viewers (not the
-// publisher).
-//
-// It relays the publisher's raw WebM through a per-room webmRelay, which
-// deterministically produces "init + first complete Cluster" (the keyframe)
-// then complete Clusters. The keyframe is cached for late joiners and delivered
-// to every viewer (clearing its init-pending gate); media Clusters are
-// delivered only to viewers whose init has already been delivered.
-func (r *Room) BroadcastScreen(sender *websocket.Conn, message []byte) {
+// BroadcastScreen relays a publisher's raw WebM to its viewers via a
+// per-publisher webmRelay. Identical to the old single-publisher logic, scoped
+// to `pub`.
+func (r *Room) BroadcastScreen(pub *screenPublisher, message []byte) {
 	r.mutex.Lock()
 
-	relay := r.screenRelay
-
-	// Drop the publisher's periodic re-broadcast init segments. The relay
-	// captures the init once in its keyframe; feeding a second (bare) init
-	// would concatenate it onto the current Cluster and emit one corrupt unit
-	// that makes every viewer's SourceBuffer error out.
+	relay := pub.relay
 	if relay != nil && isEBMLHeader(message) {
 		r.mutex.Unlock()
 		return
 	}
-
 	if relay == nil {
 		relay = &webmRelay{maxPending: maxScreenPendingBytes}
-		r.screenRelay = relay
+		pub.relay = relay
 	}
 
 	units, keyframeFinalized := relay.feed(message)
 
-	// Cache the keyframe (init + first complete Cluster) for late joiners.
 	if keyframeFinalized && relay.keyframe != nil {
-		r.screenInitSegment = append([]byte(nil), relay.keyframe...)
+		pub.initSegment = append([]byte(nil), relay.keyframe...)
 		if relay.initHeader != nil {
-			r.screenInitHeader = append([]byte(nil), relay.initHeader...)
+			pub.initHeader = append([]byte(nil), relay.initHeader...)
 		}
-		r.screenInitReady = true
-		r.screenInitBuffer = nil
-		log.Printf("screenshare init cached: room=%s bytes=%d", r.id, len(r.screenInitSegment))
+		log.Printf("screenshare init cached: room=%s publisher=%s bytes=%d", r.id, pub.userID, len(pub.initSegment))
 	}
-	// Track the most recent complete Cluster so keyframe requests can be
-	// answered with a FRESH keyframe instead of the stale stream-start keyframe.
 	if relay.lastCluster != nil {
-		r.screenLastCluster = append([]byte(nil), relay.lastCluster...)
+		pub.lastCluster = append([]byte(nil), relay.lastCluster...)
 	}
 
-	// Build the ordered list of (connection, payload) writes under the room
-	// lock. The keyframe is the FIRST unit and is delivered to every viewer
-	// (clearing its init-pending gate); media Clusters go only to viewers whose
-	// gate is already clear.
 	type screenWrite struct {
 		conn *websocket.Conn
 		data []byte
@@ -843,14 +820,14 @@ func (r *Room) BroadcastScreen(sender *websocket.Conn, message []byte) {
 	var writes []screenWrite
 	for i, unit := range units {
 		isKeyframe := keyframeFinalized && i == 0
-		for client := range r.screenViewers {
-			if client == sender {
+		for client := range pub.viewers {
+			if client == pub.conn {
 				continue
 			}
 			if isKeyframe {
 				writes = append(writes, screenWrite{client, unit})
-				delete(r.screenInitPending, client)
-			} else if !r.screenInitPending[client] {
+				delete(pub.initPending, client)
+			} else if !pub.initPending[client] {
 				writes = append(writes, screenWrite{client, unit})
 			}
 		}
@@ -858,9 +835,6 @@ func (r *Room) BroadcastScreen(sender *websocket.Conn, message []byte) {
 
 	r.mutex.Unlock()
 
-	// Transmit. Writes are serialized through screenWriteMu so they can never
-	// race the one-time init write in handleScreenViewer on the same connection
-	// (gorilla/websocket panics on concurrent writes).
 	r.screenWriteMu.Lock()
 	defer r.screenWriteMu.Unlock()
 	for _, w := range writes {
@@ -871,28 +845,16 @@ func (r *Room) BroadcastScreen(sender *websocket.Conn, message []byte) {
 	}
 }
 
-// SendScreenKeyframe re-sends the cached screen keyframe (init + first complete
-// Cluster) to the requesting viewer. This supports the viewer's recovery path:
-// when a viewer's SourceBuffer fails and is rebuilt, it sends a
-// {"type":"request_keyframe"} control message and we reply with a fresh
-// keyframe so it can re-seed its MediaSource. Without this the viewer would
-// wait forever, because the publisher only emits its init once at stream start.
-//
-// The write is serialized through screenWriteMu so it can never race the
-// publisher's BroadcastScreen writes to the same connection.
-func (r *Room) SendScreenKeyframe(requester *websocket.Conn) {
+// SendScreenKeyframe re-sends a publisher's cached keyframe to a requesting viewer.
+func (r *Room) SendScreenKeyframe(pub *screenPublisher, requester *websocket.Conn) {
 	r.mutex.Lock()
 	var keyframe []byte
-	// Answer with a FRESH keyframe (init + most recent complete Cluster) so a
-	// rebuilt viewer resumes at the current screen rather than replaying the
-	// stream's very first frames. Falls back to the cached initial keyframe if
-	// the fresh parts are not available yet.
-	if r.screenInitHeader != nil && r.screenLastCluster != nil {
-		keyframe = make([]byte, 0, len(r.screenInitHeader)+len(r.screenLastCluster))
-		keyframe = append(keyframe, r.screenInitHeader...)
-		keyframe = append(keyframe, r.screenLastCluster...)
+	if pub.initHeader != nil && pub.lastCluster != nil {
+		keyframe = make([]byte, 0, len(pub.initHeader)+len(pub.lastCluster))
+		keyframe = append(keyframe, pub.initHeader...)
+		keyframe = append(keyframe, pub.lastCluster...)
 	} else {
-		keyframe = r.screenInitSegment
+		keyframe = pub.initSegment
 	}
 	r.mutex.Unlock()
 
@@ -907,68 +869,89 @@ func (r *Room) SendScreenKeyframe(requester *websocket.Conn) {
 	}
 }
 
-// --- WebRTC screen-share signaling ---
+// --- WebRTC screen-share signaling (per publisher) ---
 
-// ScreenPublisherMode returns the publisher's announced signaling mode
-// ("webrtc" or "mse"). Empty is treated as "mse".
-func (r *Room) ScreenPublisherMode() string {
+// setScreenPublisherMode records the signaling mode a publisher announced.
+func (r *Room) setScreenPublisherMode(pub *screenPublisher, mode string) {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
-	if r.screenPublisherMode == "" {
+	pub.mode = mode
+}
+
+// screenPublisherMode returns a publisher's announced mode ("" => "mse").
+func (r *Room) screenPublisherMode(pub *screenPublisher) string {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	if pub.mode == "" {
 		return "mse"
 	}
-	return r.screenPublisherMode
+	return pub.mode
 }
 
-// SetScreenPublisherMode records the signaling mode the publisher announced.
-func (r *Room) SetScreenPublisherMode(mode string) {
+// getScreenSFU returns a publisher's SFU, or nil.
+func (r *Room) getScreenSFU(pub *screenPublisher) *ScreenSFU {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
-	r.screenPublisherMode = mode
+	return pub.sfu
 }
 
-// SendToScreenPublisher writes a JSON signaling message to the screen
-// publisher. Serialized via screenPublisherWriteMu so concurrent viewer
-// read-loops never write to the publisher connection at once.
-func (r *Room) SendToScreenPublisher(data []byte) {
+// ensureScreenSFU creates a publisher's SFU (Pion) if it does not already exist.
+func (r *Room) ensureScreenSFU(pub *screenPublisher) {
 	r.mutex.Lock()
-	pub := r.screenPublisher
-	r.mutex.Unlock()
-	if pub == nil {
+	if pub.sfu != nil {
+		r.mutex.Unlock()
 		return
 	}
-
-	r.screenPublisherWriteMu.Lock()
-	defer r.screenPublisherWriteMu.Unlock()
-	if err := pub.WriteMessage(websocket.TextMessage, data); err != nil {
-		log.Printf("Error sending signaling to screen publisher in room %s: %v", r.id, err)
-	}
-}
-
-// ForwardToScreenPublisher tags the given raw viewer message with
-// from_userid and relays it to the publisher. Used for answer/ICE from a
-// viewer, which the publisher associates with a specific RTCPeerConnection
-// by viewer user id.
-func (r *Room) ForwardToScreenPublisher(fromUserID string, raw []byte) {
-	var m map[string]interface{}
-	if err := json.Unmarshal(raw, &m); err != nil {
-		return
-	}
-	m["from_userid"] = fromUserID
-	out, err := json.Marshal(m)
+	sfu, err := newScreenSFU(r, pub)
 	if err != nil {
+		r.mutex.Unlock()
+		log.Printf("Failed to create SFU for room %s: %v", r.id, err)
 		return
 	}
-	r.SendToScreenPublisher(out)
+	pub.sfu = sfu
+	r.mutex.Unlock()
 }
 
-// SendToScreenViewerByUserID writes a JSON signaling message to the viewer
-// with the given user id (the publisher targets one viewer per
-// RTCPeerConnection).
-func (r *Room) SendToScreenViewerByUserID(userID string, data []byte) {
+// addSFUViewer registers a viewer with a publisher's SFU (no-op if no SFU yet).
+func (r *Room) addSFUViewer(pub *screenPublisher, conn *websocket.Conn, userId string) {
+	r.mutex.Lock()
+	sfu := pub.sfu
+	r.mutex.Unlock()
+	if sfu != nil {
+		sfu.AddViewer(conn, userId)
+	}
+}
+
+// setupAllSFUViewers creates SFU offers for every already-connected viewer. Used
+// when a publisher announces "sfu" after viewers have already joined.
+func (r *Room) setupAllSFUViewers(pub *screenPublisher) {
+	type item struct {
+		conn *websocket.Conn
+		uid  string
+	}
+
+	r.mutex.Lock()
+	sfu := pub.sfu
+	viewers := make([]item, 0, len(pub.viewers))
+	for conn, uid := range pub.viewers {
+		viewers = append(viewers, item{conn, uid})
+	}
+	r.mutex.Unlock()
+
+	if sfu == nil {
+		return
+	}
+	for _, v := range viewers {
+		sfu.AddViewer(v.conn, v.uid)
+	}
+}
+
+// sendToViewerByUserID writes a JSON signaling message to one of a publisher's
+// viewers (the publisher targets one viewer per RTCPeerConnection in mesh mode).
+func (r *Room) sendToViewerByUserID(pub *screenPublisher, userID string, data []byte) {
 	r.mutex.Lock()
 	var target *websocket.Conn
-	for conn, uid := range r.screenViewers {
+	for conn, uid := range pub.viewers {
 		if uid == userID {
 			target = conn
 			break
@@ -986,38 +969,49 @@ func (r *Room) SendToScreenViewerByUserID(userID string, data []byte) {
 	}
 }
 
-// NotifyViewerMode sends the publisher's current mode to a single viewer.
-func (r *Room) NotifyViewerMode(conn *websocket.Conn, mode string) {
-	data, _ := json.Marshal(map[string]string{"type": "mode", "mode": mode})
-	r.screenWriteMu.Lock()
-	defer r.screenWriteMu.Unlock()
-	if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
-		log.Printf("Error sending mode to screen viewer in room %s: %v", r.id, err)
+// send writes a JSON signaling message to this publisher, serialized so
+// concurrent viewer/SFU goroutines never write to the same connection at once.
+func (p *screenPublisher) send(data []byte) {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	if err := p.conn.WriteMessage(websocket.TextMessage, data); err != nil {
+		log.Printf("Error sending signaling to screen publisher: %v", err)
 	}
 }
 
-// NotifyViewerJoined tells the publisher a new viewer connected so it can
-// create an RTCPeerConnection + offer for that viewer.
-func (r *Room) NotifyViewerJoined(userID string) {
+// forward tags the given viewer message with from_userid and relays it to the
+// publisher (mesh mode answer/ICE).
+func (p *screenPublisher) forward(fromUserID string, raw []byte) {
+	var m map[string]interface{}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return
+	}
+	m["from_userid"] = fromUserID
+	out, err := json.Marshal(m)
+	if err != nil {
+		return
+	}
+	p.send(out)
+}
+
+// notifyViewerJoined tells this publisher a new viewer connected (mesh mode).
+func (p *screenPublisher) notifyViewerJoined(userID string) {
 	data, _ := json.Marshal(map[string]string{"type": "viewer_joined", "userid": userID})
-	r.SendToScreenPublisher(data)
+	p.send(data)
 }
 
-// NotifyViewerLeft tells the publisher a viewer disconnected so it can close
-// that viewer's RTCPeerConnection.
-func (r *Room) NotifyViewerLeft(userID string) {
+// notifyViewerLeft tells this publisher a viewer disconnected (mesh mode).
+func (p *screenPublisher) notifyViewerLeft(userID string) {
 	data, _ := json.Marshal(map[string]string{"type": "viewer_left", "userid": userID})
-	r.SendToScreenPublisher(data)
+	p.send(data)
 }
 
-// BroadcastModeToViewers pushes the publisher's mode to every connected
-// viewer. Used when the publisher announces its mode after viewers have
-// already joined.
-func (r *Room) BroadcastModeToViewers(mode string) {
+// broadcastModeToViewers pushes a publisher's mode to every connected viewer.
+func (r *Room) broadcastModeToViewers(pub *screenPublisher, mode string) {
 	data, _ := json.Marshal(map[string]string{"type": "mode", "mode": mode})
 	r.mutex.Lock()
-	viewers := make([]*websocket.Conn, 0, len(r.screenViewers))
-	for conn := range r.screenViewers {
+	viewers := make([]*websocket.Conn, 0, len(pub.viewers))
+	for conn := range pub.viewers {
 		viewers = append(viewers, conn)
 	}
 	r.mutex.Unlock()
@@ -1031,10 +1025,19 @@ func (r *Room) BroadcastModeToViewers(mode string) {
 	}
 }
 
+// NotifyViewerMode sends the publisher's current mode to a single viewer.
+func (r *Room) NotifyViewerMode(conn *websocket.Conn, mode string) {
+	data, _ := json.Marshal(map[string]string{"type": "mode", "mode": mode})
+	r.screenWriteMu.Lock()
+	defer r.screenWriteMu.Unlock()
+	if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+		log.Printf("Error sending mode to screen viewer in room %s: %v", r.id, err)
+	}
+}
+
 // SendToScreenViewerConn writes a JSON signaling message to a specific screen
 // viewer connection. Serialized via screenWriteMu so it can never race the
-// publisher's BroadcastScreen writes or another SFU write to the same
-// connection.
+// publisher's BroadcastScreen writes or another SFU write to the same connection.
 func (r *Room) SendToScreenViewerConn(conn *websocket.Conn, data []byte) {
 	r.screenWriteMu.Lock()
 	defer r.screenWriteMu.Unlock()
@@ -1043,98 +1046,39 @@ func (r *Room) SendToScreenViewerConn(conn *websocket.Conn, data []byte) {
 	}
 }
 
-// EnsureScreenSFU creates the room's SFU (Pion) if it does not already exist.
-// Called when the publisher announces "sfu" mode.
-func (r *Room) EnsureScreenSFU() {
-	r.mutex.Lock()
-	if r.screenSFU != nil {
-		r.mutex.Unlock()
-		return
-	}
-	sfu, err := newScreenSFU(r)
-	if err != nil {
-		r.mutex.Unlock()
-		log.Printf("Failed to create SFU for room %s: %v", r.id, err)
-		return
-	}
-	r.screenSFU = sfu
-	r.mutex.Unlock()
-}
-
-// AddScreenSFUViewer registers a viewer with the room's SFU. Safe to call even
-// if the SFU does not exist yet (a viewer may join before the publisher
-// announces "sfu"): the viewer is remembered and its offer is deferred.
-func (r *Room) AddScreenSFUViewer(conn *websocket.Conn, userId string) {
-	r.mutex.Lock()
-	sfu := r.screenSFU
-	r.mutex.Unlock()
-	if sfu != nil {
-		sfu.AddViewer(conn, userId)
-	}
-}
-
-// SetupAllSFUViewers creates SFU offers for every already-connected viewer.
-// Used when the publisher announces "sfu" after viewers have joined.
-func (r *Room) SetupAllSFUViewers() {
-	type item struct {
-		conn *websocket.Conn
-		uid  string
-	}
+// BroadcastScreenShareState notifies every audio client in the room that a
+// screen share started or stopped. state is "screen_share_started" or
+// "screen_share_stopped". Each publisher fires this once with its own user id.
+func (r *Room) BroadcastScreenShareState(state, userID string) {
+	data, _ := json.Marshal(map[string]string{
+		"type":    state,
+		"user_id": userID,
+	})
 
 	r.mutex.Lock()
-	sfu := r.screenSFU
-	viewers := make([]item, 0, len(r.screenViewers))
-	for conn, uid := range r.screenViewers {
-		viewers = append(viewers, item{conn, uid})
+	targets := make([]*websocket.Conn, 0, len(r.clients))
+	for c, uid := range r.clients {
+		if uid == userID {
+			continue // don't notify the sharer themselves
+		}
+		targets = append(targets, c)
 	}
 	r.mutex.Unlock()
 
-	if sfu == nil {
-		return
-	}
-	for _, v := range viewers {
-		sfu.AddViewer(v.conn, v.uid)
+	r.audioWriteMu.Lock()
+	defer r.audioWriteMu.Unlock()
+	for _, c := range targets {
+		if err := c.WriteMessage(websocket.TextMessage, data); err != nil {
+			log.Printf("Error broadcasting %s in room %s: %v", state, r.id, err)
+		}
 	}
 }
 
-// HandleScreenSFUOffer forwards the publisher's SDP offer to the SFU.
-func (r *Room) HandleScreenSFUOffer(sdp string) {
-	r.mutex.Lock()
-	sfu := r.screenSFU
-	r.mutex.Unlock()
-	if sfu != nil {
-		sfu.HandlePublisherOffer(sdp)
-	}
-}
-
-// HandleScreenSFUPublisherICE forwards the publisher's ICE candidate to the SFU.
-func (r *Room) HandleScreenSFUPublisherICE(candidate webrtc.ICECandidateInit) {
-	r.mutex.Lock()
-	sfu := r.screenSFU
-	r.mutex.Unlock()
-	if sfu != nil {
-		sfu.HandlePublisherICE(candidate)
-	}
-}
-
-// HandleScreenSFUViewerAnswer forwards a viewer's SDP answer to the SFU.
-func (r *Room) HandleScreenSFUViewerAnswer(conn *websocket.Conn, sdp string) {
-	r.mutex.Lock()
-	sfu := r.screenSFU
-	r.mutex.Unlock()
-	if sfu != nil {
-		sfu.HandleViewerAnswer(conn, sdp)
-	}
-}
-
-// HandleScreenSFUViewerICE forwards a viewer's ICE candidate to the SFU.
-func (r *Room) HandleScreenSFUViewerICE(conn *websocket.Conn, candidate webrtc.ICECandidateInit) {
-	r.mutex.Lock()
-	sfu := r.screenSFU
-	r.mutex.Unlock()
-	if sfu != nil {
-		sfu.HandleViewerICE(conn, candidate)
-	}
+// NotifyScreenShareState sends a single screen_share_started/stopped
+// notification to one audio client (used for late joiners).
+func (r *Room) NotifyScreenShareState(conn *websocket.Conn, state, userID string) {
+	data, _ := json.Marshal(map[string]string{"type": state, "user_id": userID})
+	r.SendToAudioClient(conn, data)
 }
 
 // SendToAudioClient writes a JSON signaling message to a specific audio client

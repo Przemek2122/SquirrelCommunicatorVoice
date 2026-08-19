@@ -20,6 +20,10 @@ func main() {
 	// Initialize our microservice core
 	manager := NewRoomManager()
 
+	// Hard (but configurable) cap on concurrent screen shares per room.
+	maxScreenSharesPerRoom = GetMaxScreenSharesPerRoom()
+	fmt.Printf("Max concurrent screen shares per room: %d\n", maxScreenSharesPerRoom)
+
 	// Debug room
 	manager.CreateRoom("test", "test")
 

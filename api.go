@@ -240,6 +240,12 @@ func handleAudioStream(rm *RoomManager, w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// If a screen share is already in progress, tell this late-joining client so
+	// it can show the LIVE badge and offer a one-click watch.
+	for _, pubID := range room.CurrentScreenSharePublishers() {
+		room.NotifyScreenShareState(conn, "screen_share_started", pubID)
+	}
+
 	// 2. Ensure the client is removed when they disconnect
 	defer rm.LeaveRoom(roomID, conn)
 

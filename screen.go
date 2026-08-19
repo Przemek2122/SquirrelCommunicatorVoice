@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 
@@ -11,10 +12,12 @@ import (
 
 // handleScreenShare handles WebSocket connections for screen sharing.
 // Two roles via query param ?role=publisher|viewer:
-//   - "publisher": sends video frames which are broadcast to all viewers
-//   - "viewer":   receives the screen stream (one-to-many from publisher)
+//   - "publisher": sends video frames which are broadcast to that publisher's viewers
+//   - "viewer":    receives one specific publisher's screen stream
 //
-// Query params: room, userid, token, role
+// Multiple publishers may share in the same voice channel at once (Discord-style).
+// A viewer chooses which publisher to watch via the ?target=<publisher_userid>
+// query param. Query params: room, userid, token, role, target.
 func handleScreenShare(rm *RoomManager, w http.ResponseWriter, r *http.Request) {
 	// --- Parse query params ---
 	roomID := r.URL.Query().Get("room")
@@ -67,32 +70,40 @@ func handleScreenShare(rm *RoomManager, w http.ResponseWriter, r *http.Request) 
 	case "publisher":
 		handleScreenPublisher(rm, room, conn, userId, roomID)
 	case "viewer":
-		handleScreenViewer(rm, room, conn, userId, roomID)
+		handleScreenViewer(rm, room, conn, userId, roomID, r)
 	}
 }
 
-// handleScreenPublisher reads video frames from the publisher and broadcasts to all viewers.
+// handleScreenPublisher reads video frames from a publisher and broadcasts them
+// to that publisher's viewers. Any number of publishers may share at once, each
+// with its own relay / SFU / viewer set.
 func handleScreenPublisher(rm *RoomManager, room *Room, conn *websocket.Conn, userId, roomID string) {
-	// Try to become the publisher; reject if one already exists
-	if !room.SetScreenPublisher(conn, userId) {
-		log.Printf("[screen] Room [%s] already has a publisher\n", roomID)
-		conn.WriteMessage(websocket.TextMessage, []byte(`{"error":"Room already has an active publisher"}`))
+	pub := room.AddScreenPublisher(conn, userId)
+	if pub == nil {
+		// Rejected by the per-room screen-share limit. Send a JSON error so the
+		// frontend can surface it, then close the connection.
+		resp, _ := json.Marshal(map[string]string{
+			"error": fmt.Sprintf("Screen share limit reached (%d concurrent shares max)", maxScreenSharesPerRoom),
+		})
+		conn.WriteMessage(websocket.TextMessage, resp)
 		return
 	}
 
-	// Cleanup on disconnect: clear publisher + close all viewers
+	// Notify everyone else in the voice channel that a screen share started.
+	room.BroadcastScreenShareState("screen_share_started", userId)
+
+	// Cleanup on disconnect: clear this publisher + close all of its viewers.
 	defer func() {
-		viewers := room.ClearScreenPublisher(conn)
-		// Close viewer connections outside any lock
+		viewers := room.ClearScreenPublisher(pub)
+		room.BroadcastScreenShareState("screen_share_stopped", userId)
 		for _, vConn := range viewers {
 			vConn.Close()
 		}
-		// Check if room is now fully empty
 		rm.resetIdleIfEmpty(roomID)
 	}()
 
 	// Read loop: broadcast binary video frames (MSE mode) and route WebRTC
-	// signaling (offer/ICE) to the targeted viewer.
+	// signaling (offer/ICE) to the targeted viewer or this publisher's SFU.
 	for {
 		messageType, message, err := conn.ReadMessage()
 		if err != nil {
@@ -101,7 +112,7 @@ func handleScreenPublisher(rm *RoomManager, room *Room, conn *websocket.Conn, us
 		}
 
 		if messageType == websocket.BinaryMessage {
-			room.BroadcastScreen(conn, message)
+			room.BroadcastScreen(pub, message)
 			continue
 		}
 
@@ -119,26 +130,30 @@ func handleScreenPublisher(rm *RoomManager, room *Room, conn *websocket.Conn, us
 			switch ctrl.Type {
 			case "hello":
 				if ctrl.Mode != "" {
-					room.SetScreenPublisherMode(ctrl.Mode)
-					room.BroadcastModeToViewers(ctrl.Mode)
+					room.setScreenPublisherMode(pub, ctrl.Mode)
+					room.broadcastModeToViewers(pub, ctrl.Mode)
 					if ctrl.Mode == "sfu" {
-						room.EnsureScreenSFU()
-						room.SetupAllSFUViewers()
+						room.ensureScreenSFU(pub)
+						room.setupAllSFUViewers(pub)
 					}
 				}
 			case "offer":
-				if room.ScreenPublisherMode() == "sfu" {
-					log.Printf("[screen] publisher sent SFU offer in room [%s]", roomID)
-					room.EnsureScreenSFU()
-					room.HandleScreenSFUOffer(ctrl.SDP)
+				if room.screenPublisherMode(pub) == "sfu" {
+					log.Printf("[screen] publisher [%s] sent SFU offer in room [%s]", userId, roomID)
+					room.ensureScreenSFU(pub)
+					if sfu := room.getScreenSFU(pub); sfu != nil {
+						sfu.HandlePublisherOffer(ctrl.SDP)
+					}
 				} else if ctrl.TargetUserID != "" {
-					room.SendToScreenViewerByUserID(ctrl.TargetUserID, message)
+					room.sendToViewerByUserID(pub, ctrl.TargetUserID, message)
 				}
 			case "ice":
-				if room.ScreenPublisherMode() == "sfu" {
-					room.HandleScreenSFUPublisherICE(ctrl.Candidate)
+				if room.screenPublisherMode(pub) == "sfu" {
+					if sfu := room.getScreenSFU(pub); sfu != nil {
+						sfu.HandlePublisherICE(ctrl.Candidate)
+					}
 				} else if ctrl.TargetUserID != "" {
-					room.SendToScreenViewerByUserID(ctrl.TargetUserID, message)
+					room.sendToViewerByUserID(pub, ctrl.TargetUserID, message)
 				}
 			}
 			continue
@@ -146,56 +161,61 @@ func handleScreenPublisher(rm *RoomManager, room *Room, conn *websocket.Conn, us
 	}
 }
 
-// handleScreenViewer keeps the connection alive and receives screen frames pushed by the publisher.
-// The read loop serves only as disconnect detection.
-func handleScreenViewer(rm *RoomManager, room *Room, conn *websocket.Conn, userId, roomID string) {
-	// Atomically register the viewer and obtain the init segment to send first.
-	// Registration marks the viewer as "init pending", so BroadcastScreen will
-	// not relay any media to it until we deliver the init below.
-	initSeg := room.RegisterScreenViewer(conn, userId)
+// handleScreenViewer connects a viewer to a specific publisher (selected by the
+// ?target= param) and relays that publisher's stream + signaling to it.
+func handleScreenViewer(rm *RoomManager, room *Room, conn *websocket.Conn, userId, roomID string, r *http.Request) {
+	targetUserID := r.URL.Query().Get("target")
+	if targetUserID == "" {
+		log.Printf("[screen] Viewer [%s] in room [%s] did not specify a target publisher\n", userId, roomID)
+		resp, _ := json.Marshal(map[string]string{"error": "No target publisher specified"})
+		conn.WriteMessage(websocket.TextMessage, resp)
+		return
+	}
+
+	pub := room.getScreenPublisherByUserID(targetUserID)
+	if pub == nil {
+		log.Printf("[screen] Viewer [%s] in room [%s] targeted unknown publisher [%s]\n", userId, roomID, targetUserID)
+		resp, _ := json.Marshal(map[string]string{"error": "Target publisher not found"})
+		conn.WriteMessage(websocket.TextMessage, resp)
+		return
+	}
+
+	// Atomically register the viewer with that publisher and get its init segment.
+	initSeg := room.RegisterScreenViewer(pub, conn, userId)
 
 	// Cleanup on disconnect
 	defer func() {
-		room.RemoveScreenViewer(conn)
+		room.RemoveScreenViewer(pub, conn)
 		rm.resetIdleIfEmpty(roomID)
 	}()
 
-	// Determine the publisher's signaling mode and tell both sides what to do.
-	mode := room.ScreenPublisherMode()
-	log.Printf("[screen] viewer joined room [%s], publisher mode=%s", roomID, mode)
+	mode := room.screenPublisherMode(pub)
+	log.Printf("[screen] viewer [%s] joined room [%s] watching publisher [%s] mode=%s", userId, roomID, targetUserID, mode)
 	room.NotifyViewerMode(conn, mode)
 
 	if mode == "sfu" {
-		// SFU: the server relays the publisher's single upstream stream to this
-		// viewer via Pion. The SFU sends an offer here; media flows
-		// server -> viewer, so the publisher upload stays at 1x.
-		room.AddScreenSFUViewer(conn, userId)
+		// SFU: the server relays this publisher's stream to this viewer via Pion.
+		room.addSFUViewer(pub, conn, userId)
 	} else if mode == "webrtc" {
-		// WebRTC mesh: the publisher creates one RTCPeerConnection per viewer
-		// and sends an offer through us. Media then flows peer-to-peer (no
-		// relay), which removes the MediaRecorder/MSE latency entirely.
-		room.NotifyViewerJoined(userId)
+		// WebRTC mesh: the publisher creates one RTCPeerConnection per viewer.
+		pub.notifyViewerJoined(userId)
 	} else if initSeg != nil {
-		// MSE fallback: serve the cached init first (existing behavior). The
-		// write is serialized with BroadcastScreen via room.screenWriteMu, and
-		// the init-pending gate guarantees no media frame reaches this viewer
-		// before MarkScreenInitDelivered clears it.
+		// MSE fallback: serve the cached init first. Serialized with
+		// BroadcastScreen via room.screenWriteMu, and the init-pending gate
+		// guarantees no media reaches this viewer before MarkScreenInitDelivered.
 		log.Printf("screenshare init served: room=%s userid=%s bytes=%d", roomID, userId, len(initSeg))
-
 		room.screenWriteMu.Lock()
 		err := conn.WriteMessage(websocket.BinaryMessage, initSeg)
 		room.screenWriteMu.Unlock()
-
 		if err != nil {
 			log.Printf("[screen] Error sending init segment to viewer [%s]: %v\n", userId, err)
 			return
 		}
-
-		room.MarkScreenInitDelivered(conn)
+		room.MarkScreenInitDelivered(pub, conn)
 	}
 
 	// Block on reads to detect disconnects. The viewer also sends WebRTC
-	// signaling (answer/ICE) which we forward to the publisher, and an MSE
+	// signaling (answer/ICE) which we forward to its publisher, and an MSE
 	// {"type":"request_keyframe"} control message after a MediaSource rebuild.
 	for {
 		messageType, message, err := conn.ReadMessage()
@@ -214,22 +234,25 @@ func handleScreenViewer(rm *RoomManager, room *Room, conn *websocket.Conn, userI
 			}
 			switch ctrl.Type {
 			case "hello":
-				// Viewer capability announcement — the server already told the
-				// viewer the publisher's mode; nothing to do here.
+				// Viewer capability announcement — nothing to do here.
 			case "answer":
-				if room.ScreenPublisherMode() == "sfu" {
-					room.HandleScreenSFUViewerAnswer(conn, ctrl.SDP)
+				if room.screenPublisherMode(pub) == "sfu" {
+					if sfu := room.getScreenSFU(pub); sfu != nil {
+						sfu.HandleViewerAnswer(conn, ctrl.SDP)
+					}
 				} else {
-					room.ForwardToScreenPublisher(userId, message)
+					pub.forward(userId, message)
 				}
 			case "ice":
-				if room.ScreenPublisherMode() == "sfu" {
-					room.HandleScreenSFUViewerICE(conn, ctrl.Candidate)
+				if room.screenPublisherMode(pub) == "sfu" {
+					if sfu := room.getScreenSFU(pub); sfu != nil {
+						sfu.HandleViewerICE(conn, ctrl.Candidate)
+					}
 				} else {
-					room.ForwardToScreenPublisher(userId, message)
+					pub.forward(userId, message)
 				}
 			case "request_keyframe":
-				room.SendScreenKeyframe(conn)
+				room.SendScreenKeyframe(pub, conn)
 			}
 		}
 	}

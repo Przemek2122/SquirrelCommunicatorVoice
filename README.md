@@ -6,6 +6,7 @@
 ##### Initial setup: (os env)
 ###### SQRLL_VOICE_PORT – Change port which this server will run on.
 ###### SQRLL_VOICE_API_KEY – Key for server to access sensitive functions (create room, etc)
+###### SQRLL_MAX_SCREENSHARES_PER_ROOM – Max concurrent screen shares per room (default 5)
 
 ---
 
@@ -281,7 +282,7 @@ mediaSource.addEventListener('sourceopen', () => {
 
 ## Screen Share Streaming
 
-Screen sharing allows one user per room to broadcast their screen to multiple viewers via WebSocket.
+Screen sharing allows multiple users per room (up to a configurable hard limit, default 5) to broadcast their screen to viewers via WebSocket.
 
 ### Endpoint
 
@@ -307,7 +308,7 @@ ws://host/api/rooms/screenshare?room=X&userid=Y&token=Z&role=publisher|viewer
 > MediaRecorder/MSE backlog entirely. The legacy `MediaRecorder → WebSocket →
 > MediaSource` path below remains only as an automatic fallback.
 
-- **Publisher** — Exactly **one per room**. In MSE fallback mode it sends raw WebM video binary frames (VP8/VP9) via WebSocket. All frames are broadcast to every viewer. If a second publisher tries to connect, they receive a JSON error and are rejected.
+- **Publisher** — **Multiple per room** (up to the `SQRLL_MAX_SCREENSHARES_PER_ROOM` limit, default 5). In MSE fallback mode each publisher sends raw WebM video binary frames (VP8/VP9) via WebSocket to their own viewers. A publisher that exceeds the limit receives a JSON error and is rejected.
 
 - **Viewer** — Receives raw `video/webm` binary frames pushed by the publisher. On join, the viewer is immediately sent the cached WebM initialization segment (if available) so they can decode the ongoing stream without waiting for the next keyframe.
 
@@ -367,7 +368,7 @@ mediaSource.addEventListener('sourceopen', () => {
 
 | Limit                     | Value        |
 |---------------------------|--------------|
-| Max publishers per room   | 1            |
+| Max publishers per room   | 5 (configurable via `SQRLL_MAX_SCREENSHARES_PER_ROOM`) |
 | Max video frame size      | 5 MB         |
 | Room idle timeout         | 10 minutes   |
 
@@ -410,4 +411,4 @@ mediaSource.addEventListener('sourceopen', () => {
 | **Framing**      | Custom: `[1B len][ID][chunk]`  | Raw WebM frames                  |
 | **Init caching** | Per-client (one per sender)    | Single (per-room)                |
 | **Late-join**    | All cached init segments sent  | Cached init segment sent         |
-| **Max senders**  | Unlimited                      | 1 publisher                      |
+| **Max senders**  | Unlimited                      | 5 (configurable, `SQRLL_MAX_SCREENSHARES_PER_ROOM`) |
