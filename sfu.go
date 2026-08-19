@@ -118,7 +118,8 @@ func newScreenSFU(room *Room, pub *screenPublisher) (*ScreenSFU, error) {
 	if err != nil {
 		return nil, err
 	}
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{ICEServers: sfuICEServers}, webrtc.WithMediaEngine(mediaEngine))
+	api := webrtc.NewAPI(webrtc.WithMediaEngine(mediaEngine))
+	pc, err := api.NewPeerConnection(webrtc.Configuration{ICEServers: sfuICEServers})
 	if err != nil {
 		return nil, err
 	}
@@ -335,7 +336,8 @@ func (s *ScreenSFU) AddViewer(conn *websocket.Conn, userID string) {
 		log.Printf("[sfu] viewer media engine failed in room %s: %v", s.room.id, err)
 		return
 	}
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{ICEServers: sfuICEServers}, webrtc.WithMediaEngine(mediaEngine))
+	api := webrtc.NewAPI(webrtc.WithMediaEngine(mediaEngine))
+	pc, err := api.NewPeerConnection(webrtc.Configuration{ICEServers: sfuICEServers})
 	if err != nil {
 		log.Printf("[sfu] viewer PC create failed in room %s: %v", s.room.id, err)
 		return
