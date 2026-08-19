@@ -19,6 +19,54 @@ var sfuICEServers = []webrtc.ICEServer{
 	{URLs: []string{"stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"}},
 }
 
+// screenShareMediaEngine returns a MediaEngine restricted to VP8 (plus its RTX
+// retransmission codec). VP8 is the one video codec that BOTH Chrome and
+// Chromium always support for getDisplayMedia, so pinning the screen SFU to VP8
+// removes the directional interop failures that occur when a publisher's
+// preferred codec (e.g. Chromium's VP9/AV1, or Chrome's H264) does not line up
+// with what the SFU would otherwise re-offer to a viewer. The publisher-facing
+// and viewer-facing PeerConnections of the screen SFU both use this engine, so
+// the relayed codec is always VP8 regardless of browser.
+func screenShareMediaEngine() (*webrtc.MediaEngine, error) {
+	m := &webrtc.MediaEngine{}
+
+	videoRTCPFeedback := []webrtc.RTCPFeedback{
+		{Type: "goog-remb", Parameter: ""},
+		{Type: "ccm", Parameter: "fir"},
+		{Type: "nack", Parameter: ""},
+		{Type: "nack", Parameter: "pli"},
+	}
+
+	for _, codec := range []webrtc.RTPCodecParameters{
+		{
+			RTPCodecCapability: webrtc.RTPCodecCapability{
+				MimeType:     webrtc.MimeTypeVP8,
+				ClockRate:    90000,
+				Channels:     0,
+				SDPFmtpLine:  "",
+				RTCPFeedback: videoRTCPFeedback,
+			},
+			PayloadType: 96,
+		},
+		{
+			RTPCodecCapability: webrtc.RTPCodecCapability{
+				MimeType:     webrtc.MimeTypeRTX,
+				ClockRate:    90000,
+				Channels:     0,
+				SDPFmtpLine:  "apt=96",
+				RTCPFeedback: nil,
+			},
+			PayloadType: 97,
+		},
+	} {
+		if err := m.RegisterCodec(codec, webrtc.RTPCodecTypeVideo); err != nil {
+			return nil, err
+		}
+	}
+
+	return m, nil
+}
+
 // sfuViewer is a single viewer's PeerConnection on the SFU.
 type sfuViewer struct {
 	pc         *webrtc.PeerConnection
@@ -66,7 +114,11 @@ func newScreenSFU(room *Room, pub *screenPublisher) (*ScreenSFU, error) {
 		viewers: make(map[*websocket.Conn]*sfuViewer),
 	}
 
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{ICEServers: sfuICEServers})
+	mediaEngine, err := screenShareMediaEngine()
+	if err != nil {
+		return nil, err
+	}
+	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{ICEServers: sfuICEServers}, webrtc.WithMediaEngine(mediaEngine))
 	if err != nil {
 		return nil, err
 	}
@@ -278,7 +330,12 @@ func (s *ScreenSFU) AddViewer(conn *websocket.Conn, userID string) {
 	}
 	s.mutex.Unlock()
 
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{ICEServers: sfuICEServers})
+	mediaEngine, err := screenShareMediaEngine()
+	if err != nil {
+		log.Printf("[sfu] viewer media engine failed in room %s: %v", s.room.id, err)
+		return
+	}
+	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{ICEServers: sfuICEServers}, webrtc.WithMediaEngine(mediaEngine))
 	if err != nil {
 		log.Printf("[sfu] viewer PC create failed in room %s: %v", s.room.id, err)
 		return
