@@ -7,6 +7,8 @@
 ###### SQRLL_VOICE_PORT – Change port which this server will run on.
 ###### SQRLL_VOICE_API_KEY – Key for server to access sensitive functions (create room, etc)
 ###### SQRLL_MAX_SCREENSHARES_PER_ROOM – Max concurrent screen shares per room (default 5)
+###### SQRLL_IMAGE_SERVICE_URL – Base URL of the image/file service (default `http://localhost:8083`)
+###### SQRLL_IMAGE_API_KEY – Key sent to the image service as `X-SQRLL-API-KEY` (held server-side, never in the browser)
 
 ---
 
@@ -162,6 +164,56 @@ Health check for load balancers and monitoring.
 ```
 OK
 ```
+
+---
+
+### `POST /api/files/upload`
+
+Proxies a file upload to the image/file service. The browser posts raw bytes here;
+this service injects the `X-SQRLL-API-KEY` header (from `SQRLL_IMAGE_API_KEY`)
+server-side and applies rate limiting + a size cap before forwarding.
+
+**Auth:** None (public). Rate-limited per client IP.
+
+**Request body:** raw file bytes (max 8 MB).
+
+**Response:** the image service's JSON, passed through verbatim:
+```json
+{
+  "id": "sha256hex",
+  "status": "ok",
+  "size": 12345
+}
+```
+
+**Errors:**
+| Status | Condition                  |
+|--------|----------------------------|
+| 400    | Could not read body        |
+| 413    | File exceeds 8 MB          |
+| 429    | Upload rate limit exceeded |
+| 502    | Image service unreachable  |
+| 405    | Not a POST request         |
+
+---
+
+### `GET /api/files/{sha256-hash}`
+
+Streams a stored file from the image/file service. Content-addressed: the hash
+uniquely identifies the bytes, so successful responses are served with
+`Cache-Control: immutable`.
+
+**Auth:** None (public). Rate-limited per client IP (lenient — a chat view loads many images).
+
+**Path param:** `{sha256-hash}` — 64-char hex SHA-256 id.
+
+**Errors:**
+| Status | Condition                  |
+|--------|----------------------------|
+| 400    | Missing or invalid hash    |
+| 429    | Download rate limit exceeded |
+| 502    | Image service unreachable  |
+| 405    | Not a GET request          |
 
 ---
 

@@ -175,13 +175,6 @@ func (m *klipyMediaItem) toResult() *gifResult {
 
 // --- Shared helpers ---
 
-// authorized mirrors the existing REST API auth: the X-API-Token header must
-// match the configured service key. When the key is empty (local dev) the
-// check passes, matching handleCreateRoomAPI's behaviour.
-func (rm *RoomManager) authorized(r *http.Request) bool {
-	return r.Header.Get("X-API-Token") == rm.APIKey
-}
-
 // enableCORS allows the dev frontend (served from another origin) to read
 // these GET-only responses. In production everything is same-origin via the
 // reverse proxy. Returns true if the request was a preflight that we already
@@ -296,10 +289,6 @@ func (rm *RoomManager) handleGifsSearch(w http.ResponseWriter, r *http.Request) 
 		writeJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !rm.authorized(r) {
-		writeJSONError(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
 	if GetKlipyAPIKey() == "" {
 		writeJSONError(w, "GIF provider not configured", http.StatusServiceUnavailable)
 		return
@@ -328,10 +317,6 @@ func (rm *RoomManager) handleGifsTrending(w http.ResponseWriter, r *http.Request
 		writeJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !rm.authorized(r) {
-		writeJSONError(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
 	if GetKlipyAPIKey() == "" {
 		writeJSONError(w, "GIF provider not configured", http.StatusServiceUnavailable)
 		return
@@ -353,11 +338,6 @@ func (rm *RoomManager) handleGifsFetch(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !rm.authorized(r) {
-		writeJSONError(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-
 	rawURL := r.URL.Query().Get("url")
 	if rawURL == "" {
 		writeJSONError(w, "Missing url", http.StatusBadRequest)

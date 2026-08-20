@@ -46,6 +46,10 @@ func main() {
 	http.HandleFunc("/api/gifs/trending", manager.handleGifsTrending)
 	http.HandleFunc("/api/gifs/fetch", manager.handleGifsFetch)
 
+	// --- File storage proxy (upload / download via the image service) ---
+	http.HandleFunc("/api/files/upload", manager.handleFileUpload)
+	http.HandleFunc("/api/files/", manager.handleFileDownload)
+
 	// --- WebSocket endpoints ---
 	http.HandleFunc("/api/rooms/stream", func(w http.ResponseWriter, r *http.Request) {
 		handleAudioStream(manager, w, r)

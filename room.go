@@ -223,12 +223,18 @@ type RoomManager struct {
 
 	/** API Key - Password to allow editing sensitive fields called from other server. */
 	APIKey string
+
+	/** Per-IP rate limiters for the file upload / download proxy endpoints. */
+	uploadLimiter   *tokenBucketLimiter
+	downloadLimiter *tokenBucketLimiter
 }
 
 // NewRoomManager is a constructor for our service
 func NewRoomManager() *RoomManager {
 	return &RoomManager{
-		rooms: make(map[string]*Room),
+		rooms:           make(map[string]*Room),
+		uploadLimiter:   newTokenBucketLimiter(uploadRateLimitPerSec, uploadRateLimitBurst),
+		downloadLimiter: newTokenBucketLimiter(downloadRateLimitPerSec, downloadRateLimitBurst),
 	}
 }
 
