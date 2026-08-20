@@ -63,6 +63,13 @@ func handleScreenShare(rm *RoomManager, w http.ResponseWriter, r *http.Request) 
 	}
 	defer conn.Close()
 
+	// Keep the connection alive with periodic pings. Cloudflare (and other
+	// proxies) drop idle WebSocket connections after ~100 seconds, so a 60s
+	// ping prevents silent disconnects. WriteControl is used internally and is
+	// safe to run concurrently with the read loop below.
+	stopPing := startPingLoop(conn, pingInterval)
+	defer stopPing()
+
 	// Set a generous read limit for video frames (up to ~5MB)
 	conn.SetReadLimit(5 << 20) // 5 MB
 
