@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 
 	"github.com/gorilla/websocket"
@@ -51,9 +52,9 @@ func main() {
 
 	http.HandleFunc("/health", handleHealthCheck)
 
-	port := GetPort()
-	fmt.Printf("Go Microservice (Rooms) listening on port '%s'...", port)
-	err := http.ListenAndServe(port, nil)
+	addr := net.JoinHostPort(GetAddress(), GetPort())
+	fmt.Printf("Go Microservice (Rooms) listening on '%s'...", addr)
+	err := http.ListenAndServe(addr, nil)
 	if err != nil {
 		log.Fatal("Server error: ", err)
 	}

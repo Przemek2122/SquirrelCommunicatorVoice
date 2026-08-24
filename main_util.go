@@ -1,18 +1,26 @@
 package main
 
 import (
-	"fmt"
 	"os"
 	"strconv"
 )
 
+// GetPort returns the port (without the leading colon) the server listens on.
+// It defaults to 8082 and is configurable via SQRLL_VOICE_PORT.
 func GetPort() string {
 	port := os.Getenv("SQRLL_VOICE_PORT")
 	if port == "" {
 		port = "8082" // Fallback
 	}
 
-	return fmt.Sprintf(":%s", port)
+	return port
+}
+
+// GetAddress returns the bind address for the server. It is configurable via
+// SQRLL_VOICE_ADDRESS. An empty value (the default) means "all interfaces",
+// which is equivalent to the previous "*" behavior.
+func GetAddress() string {
+	return os.Getenv("SQRLL_VOICE_ADDRESS")
 }
 
 func GetAPIKey() string {

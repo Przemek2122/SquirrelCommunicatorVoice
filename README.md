@@ -4,6 +4,7 @@
 ###### Frontend available at https://github.com/Przemek2122/voice.sqrll.net
 
 ##### Initial setup: (os env)
+###### SQRLL_VOICE_ADDRESS – Bind address for the server (default: all interfaces). Example: `127.0.0.1` to bind to localhost only.
 ###### SQRLL_VOICE_PORT – Change port which this server will run on.
 ###### SQRLL_VOICE_API_KEY – Key for server to access sensitive functions (create room, etc)
 ###### SQRLL_MAX_SCREENSHARES_PER_ROOM – Max concurrent screen shares per room (default 5)
@@ -196,10 +197,10 @@ ws://host/api/rooms/stream?room=X&userid=Y&token=Z
 The server uses a **custom binary framing** so receivers can identify which user sent each audio chunk:
 
 ```
-┌──────────────┬──────────┬─────────────────────┐
+┌───────────┬────────────┬──────────────────────┐
 │  ID Length   │   ID Bytes   │   WebM Audio Chunk  │
 │   (1 byte)   │  (1–255 B)   │     (variable)       │
-└──────────────┴──────────┴─────────────────────┘
+└───────────┴────────────┴──────────────────────┘
 ```
 
 | Segment       | Size       | Description                                      |
@@ -377,14 +378,14 @@ mediaSource.addEventListener('sourceopen', () => {
 ## Architecture Overview
 
 ```
-                           ┌──────────────────────┐
+                           ┌────────────────────┐
                            │     HTTP Server      │
                            │   (Go net/http)      │
-                           └──────────┬───────────┘
+                           └───────────┬──────────┘
                                       │
-          ┌───────────────────────────┼───────────────────────────┐
+          ┌───────────────────────────┼─────────────────────────────┐
           │                           │                           │
-    ┌─────▼─────┐          ┌──────────▼───────────┐          ┌─────▼─────┐
+    ┌─────▼─────┐          ┌──────────▼──────────┐          ┌─────▼─────┐
     │  REST API │          │ Audio WS            │          │ Screen WS │
     │  /create  │          │  /stream            │          │/screenshare│
     │  /check   │          │                     │          │           │
@@ -392,11 +393,11 @@ mediaSource.addEventListener('sourceopen', () => {
     │  /remove  │          │                     │          │           │
     └───────────┘          └──────────┬──────────┘          └─────┬─────┘
                                       │                           │
-                              ┌───────▼───────┐        ┌──────────▼───────────┐
+                              ┌───────▼───────┐        ┌──────────▼──────────┐
                               │   Room Map    │        │  Room Map           │
                               │  clients[]    │        │ publisher           │
                               │  initSegs[]   │        │ viewers[]           │
-                              └───────┬───────┘        └──────────┬───────────┘
+                              └───────┬───────┘        └──────────┬──────────┘
                                       │                           │
                               ┌───────▼───────┐                   │
                               │   Broadcast   │                   │
