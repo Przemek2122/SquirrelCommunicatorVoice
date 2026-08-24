@@ -280,7 +280,7 @@ func (s *VoiceSFU) fanOutExistingTo(conn *websocket.Conn, newUserID string) {
 
 // sendOfferTo creates a downstream PeerConnection carrying a single publisher's
 // audio track and sends an offer to the subscriber.
-func (s *VoiceSFU) sendOfferTo(conn *websocket.Conn, subscriberID, publisherID string, local *webrtc.TrackLocalStaticRTP) {
+func (s *VoiceSFU) sendOfferTo(conn *websocket.Conn, _, publisherID string, local *webrtc.TrackLocalStaticRTP) {
 	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{ICEServers: sfuICEServers})
 	if err != nil {
 		log.Printf("[voice-sfu] subscriber PC create failed in room %s: %v", s.room.id, err)
@@ -377,7 +377,7 @@ func (s *VoiceSFU) HandleAnswer(conn *websocket.Conn, publisherID, sdp string) {
 }
 
 // HandleUpstreamICE adds a trickled ICE candidate from a publisher's upstream PC.
-func (s *VoiceSFU) HandleUpstreamICE(conn *websocket.Conn, userID string, candidate webrtc.ICECandidateInit) {
+func (s *VoiceSFU) HandleUpstreamICE(_ *websocket.Conn, userID string, candidate webrtc.ICECandidateInit) {
 	s.mutex.Lock()
 	pub := s.publishers[userID]
 	s.mutex.Unlock()

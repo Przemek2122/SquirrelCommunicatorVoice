@@ -161,7 +161,7 @@ func (f *webmRelay) feed(data []byte) (units [][]byte, keyframeFinalized bool) {
 
 // maxScreenSharesPerRoom caps how many people can share their screen in a
 // single room at once. It is a hard limit (enforced atomically in
-// AddScreenPublisher) but configurable via the SQRLL_MAX_SCREENSHARES_PER_ROOM
+// addScreenPublisher) but configurable via the SQRLL_MAX_SCREENSHARES_PER_ROOM
 // env var, read at startup in main().
 var maxScreenSharesPerRoom = 5
 
@@ -336,7 +336,7 @@ func (rm *RoomManager) RemoveRoom(roomID string) bool {
 	// Close all connections outside any lock — prevents deadlocks
 	// with deferred LeaveRoom / ClearScreenPublisher running in other goroutines
 	for _, conn := range allConns {
-		conn.Close()
+		_ = conn.Close()
 	}
 
 	fmt.Printf("Room [%s] forcefully removed, %d client(s) disconnected\n", roomID, totalClients)
@@ -591,7 +591,7 @@ func (r *Room) Broadcast(sender *websocket.Conn, message []byte) {
 				delete(r.initSegments, client)
 				delete(r.audioRelays, client)
 				r.mutex.Unlock()
-				client.Close()
+				_ = client.Close()
 				break
 			}
 		}
@@ -649,9 +649,9 @@ type screenPublisher struct {
 	initPending map[*websocket.Conn]bool   // viewers whose init has not been delivered yet
 }
 
-// AddScreenPublisher registers a connection as a screen publisher. Any number
+// addScreenPublisher registers a connection as a screen publisher. Any number
 // of publishers may share at once; each receives its own screenPublisher state.
-func (r *Room) AddScreenPublisher(conn *websocket.Conn, userId string) *screenPublisher {
+func (r *Room) addScreenPublisher(conn *websocket.Conn, userId string) *screenPublisher {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
@@ -840,7 +840,7 @@ func (r *Room) BroadcastScreen(pub *screenPublisher, message []byte) {
 	for _, w := range writes {
 		if err := w.conn.WriteMessage(websocket.BinaryMessage, w.data); err != nil {
 			log.Printf("Error broadcasting screen in room %s: %v", r.id, err)
-			w.conn.Close()
+			_ = w.conn.Close()
 		}
 	}
 }

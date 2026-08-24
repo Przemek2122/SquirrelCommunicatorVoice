@@ -61,7 +61,7 @@ func handleScreenShare(rm *RoomManager, w http.ResponseWriter, r *http.Request) 
 		log.Println("[screen] Upgrade error:", err)
 		return
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Keep the connection alive with periodic pings. Cloudflare (and other
 	// proxies) drop idle WebSocket connections after ~100 seconds, so a 60s
@@ -73,10 +73,9 @@ func handleScreenShare(rm *RoomManager, w http.ResponseWriter, r *http.Request) 
 	// Set a generous read limit for video frames (up to ~5MB)
 	conn.SetReadLimit(5 << 20) // 5 MB
 
-	switch role {
-	case "publisher":
+	if role == "publisher" {
 		handleScreenPublisher(rm, room, conn, userId, roomID)
-	case "viewer":
+	} else {
 		handleScreenViewer(rm, room, conn, userId, roomID, r)
 	}
 }
@@ -85,14 +84,14 @@ func handleScreenShare(rm *RoomManager, w http.ResponseWriter, r *http.Request) 
 // to that publisher's viewers. Any number of publishers may share at once, each
 // with its own relay / SFU / viewer set.
 func handleScreenPublisher(rm *RoomManager, room *Room, conn *websocket.Conn, userId, roomID string) {
-	pub := room.AddScreenPublisher(conn, userId)
+	pub := room.addScreenPublisher(conn, userId)
 	if pub == nil {
 		// Rejected by the per-room screen-share limit. Send a JSON error so the
 		// frontend can surface it, then close the connection.
 		resp, _ := json.Marshal(map[string]string{
 			"error": fmt.Sprintf("Screen share limit reached (%d concurrent shares max)", maxScreenSharesPerRoom),
 		})
-		conn.WriteMessage(websocket.TextMessage, resp)
+		_ = conn.WriteMessage(websocket.TextMessage, resp)
 		return
 	}
 
@@ -104,7 +103,7 @@ func handleScreenPublisher(rm *RoomManager, room *Room, conn *websocket.Conn, us
 		viewers := room.ClearScreenPublisher(pub)
 		room.BroadcastScreenShareState("screen_share_stopped", userId)
 		for _, vConn := range viewers {
-			vConn.Close()
+			_ = vConn.Close()
 		}
 		rm.resetIdleIfEmpty(roomID)
 	}()
@@ -175,7 +174,7 @@ func handleScreenViewer(rm *RoomManager, room *Room, conn *websocket.Conn, userI
 	if targetUserID == "" {
 		log.Printf("[screen] Viewer [%s] in room [%s] did not specify a target publisher\n", userId, roomID)
 		resp, _ := json.Marshal(map[string]string{"error": "No target publisher specified"})
-		conn.WriteMessage(websocket.TextMessage, resp)
+		_ = conn.WriteMessage(websocket.TextMessage, resp)
 		return
 	}
 
@@ -183,7 +182,7 @@ func handleScreenViewer(rm *RoomManager, room *Room, conn *websocket.Conn, userI
 	if pub == nil {
 		log.Printf("[screen] Viewer [%s] in room [%s] targeted unknown publisher [%s]\n", userId, roomID, targetUserID)
 		resp, _ := json.Marshal(map[string]string{"error": "Target publisher not found"})
-		conn.WriteMessage(websocket.TextMessage, resp)
+		_ = conn.WriteMessage(websocket.TextMessage, resp)
 		return
 	}
 

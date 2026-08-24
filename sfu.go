@@ -319,7 +319,7 @@ func isKeyframePacket(pkt *rtp.Packet, mime string) bool {
 // AddViewer creates a viewer PeerConnection and, if the publisher's track is
 // already known, sends an offer. Otherwise the offer is deferred until the
 // track arrives.
-func (s *ScreenSFU) AddViewer(conn *websocket.Conn, userID string) {
+func (s *ScreenSFU) AddViewer(conn *websocket.Conn, _ string) {
 	s.mutex.Lock()
 	if s.closed {
 		s.mutex.Unlock()

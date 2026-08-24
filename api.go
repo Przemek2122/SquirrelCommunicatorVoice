@@ -28,7 +28,7 @@ type RemoveRoomRequest struct {
 func writeJSONError(w http.ResponseWriter, message string, statusCode int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
-	json.NewEncoder(w).Encode(map[string]string{"error": message})
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
 }
 
 func (rm *RoomManager) handleCreateRoomAPI(w http.ResponseWriter, r *http.Request) {
@@ -228,7 +228,7 @@ func handleAudioStream(rm *RoomManager, w http.ResponseWriter, r *http.Request) 
 		log.Println("Upgrade error:", err)
 		return
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Keep the connection alive with periodic pings. Cloudflare (and other
 	// proxies) drop idle WebSocket connections after ~100 seconds, so a 60s
@@ -242,7 +242,7 @@ func handleAudioStream(rm *RoomManager, w http.ResponseWriter, r *http.Request) 
 
 	if room == nil {
 		// Upgrade already happened — send close frame with meaningful message
-		conn.WriteMessage(websocket.CloseMessage,
+		_ = conn.WriteMessage(websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Room not found or invalid token"))
 		return
 	}
@@ -330,5 +330,5 @@ func handleHealthCheck(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 
 	// Write a simple text response (or you could do JSON like `{"status":"ok"}`)
-	w.Write([]byte("OK"))
+	_, _ = w.Write([]byte("OK"))
 }
