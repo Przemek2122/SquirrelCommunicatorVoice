@@ -15,6 +15,33 @@ import (
 // it all in memory before the relay's safety valve ever sees it.
 const maxAudioReadBytes = 1 << 20
 
+// handshakeParamHeaders maps a WebSocket handshake query parameter to the HTTP
+// header that may be supplied instead. Headers let clients pass the room token
+// (a credential) and user id (PII) without them landing in reverse-proxy access
+// logs, browser history, or the Referer header. The query string remains fully
+// supported for backward compatibility — notably for browser WebSocket clients,
+// whose native API cannot set custom headers.
+var handshakeParamHeaders = map[string]string{
+	"room":   "X-Room-Id",
+	"userid": "X-User-Id",
+	"token":  "X-Room-Token",
+	"role":   "X-Role",
+	"target": "X-Target-User-Id",
+}
+
+// paramValue resolves a WebSocket handshake parameter, preferring the HTTP
+// header when present and falling back to the query string. If both are
+// supplied, the header wins (it is the more private, less likely to be logged
+// channel).
+func paramValue(r *http.Request, name string) string {
+	if header, ok := handshakeParamHeaders[name]; ok {
+		if v := r.Header.Get(header); v != "" {
+			return v
+		}
+	}
+	return r.URL.Query().Get(name)
+}
+
 type CreateRoomRequest struct {
 	RoomId string `json:"roomId"`
 	Token  string `json:"token"`
@@ -212,8 +239,8 @@ func (rm *RoomManager) handleCheckRoomAPI(w http.ResponseWriter, r *http.Request
 }
 
 func handleAudioStream(rm *RoomManager, w http.ResponseWriter, r *http.Request) {
-	// Get room name
-	roomID := r.URL.Query().Get("room")
+	// Get room name (header preferred, query string fallback)
+	roomID := paramValue(r, "room")
 	if roomID == "" {
 		log.Println("Missing room name")
 		writeJSONError(w, "Missing room name", http.StatusBadRequest)
@@ -221,7 +248,7 @@ func handleAudioStream(rm *RoomManager, w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Get user id
-	userId := r.URL.Query().Get("userid")
+	userId := paramValue(r, "userid")
 	if userId == "" {
 		log.Println("Missing room userid")
 		writeJSONError(w, "Missing room userid", http.StatusBadRequest)
@@ -229,7 +256,7 @@ func handleAudioStream(rm *RoomManager, w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Get room token (password)
-	token := r.URL.Query().Get("token")
+	token := paramValue(r, "token")
 	if token == "" {
 		log.Println("Missing room token")
 		writeJSONError(w, "Missing room token", http.StatusUnauthorized)

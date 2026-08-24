@@ -167,6 +167,32 @@ OK
 
 ---
 
+## WebSocket handshake parameters (query string **or** headers)
+
+Every WebSocket endpoint below accepts its handshake parameters in two ways:
+the traditional **query string** (backward compatible) or an **HTTP header**.
+The header is checked first and wins if both are present.
+
+Headers are the private option: `token` is a credential and `userid` is PII,
+and passing them in the URL leaks them into reverse-proxy access logs, browser
+history, and the `Referer` header. Passing them as headers avoids that.
+
+| Query param | HTTP header        | Used by         |
+|-------------|--------------------|-----------------|
+| `room`      | `X-Room-Id`        | audio, screen   |
+| `userid`    | `X-User-Id`        | audio, screen   |
+| `token`     | `X-Room-Token`     | audio, screen   |
+| `role`      | `X-Role`           | screen          |
+| `target`    | `X-Target-User-Id` | screen (viewer) |
+
+> **Browser clients note:** the native browser `WebSocket` API **cannot** set
+> custom headers, so browser clients must keep using the query string (or pass
+> the token as the first WebSocket message after connecting). The header
+> alternative is intended for server-side / non-browser clients — e.g. your
+> backend proxying a connection for a user.
+
+---
+
 ## Voice Streaming (Audio)
 
 Real-time audio streaming. Multiple clients per room — each client sends
@@ -193,15 +219,18 @@ ws://host/api/rooms/stream?room=X&userid=Y&token=Z
 | `userid`    | ✅       | Unique user identifier (used as audio label)|
 | `token`     | ✅       | Room access token                           |
 
+Header alternative: `X-Room-Id`, `X-User-Id`, `X-Room-Token` (see
+[WebSocket handshake parameters](#websocket-handshake-parameters-query-string-or-headers)).
+
 ### Protocol (Binary Framing)
 
 The server uses a **custom binary framing** so receivers can identify which user sent each audio chunk:
 
 ```
-┌───────────┬────────────┬──────────────────────┐
+┌─────────────┬───────────┬──────────────────┐
 │  ID Length   │   ID Bytes   │   WebM Audio Chunk  │
 │   (1 byte)   │  (1–255 B)   │     (variable)       │
-└───────────┴────────────┴──────────────────────┘
+└─────────────┴───────────┴──────────────────┘
 ```
 
 | Segment       | Size       | Description                                      |
@@ -298,6 +327,10 @@ ws://host/api/rooms/screenshare?room=X&userid=Y&token=Z&role=publisher|viewer
 | `userid`    | ✅       | Unique user identifier                                       |
 | `token`     | ✅       | Room access token                                            |
 | `role`      | ✅       | `publisher` (sends video) or `viewer` (receives video)       |
+| `target`    | viewer only | Publisher user id to watch                                |
+
+Header alternative: `X-Room-Id`, `X-User-Id`, `X-Room-Token`, `X-Role`, `X-Target-User-Id` (see
+[WebSocket handshake parameters](#websocket-handshake-parameters-query-string-or-headers)).
 
 ### How it works
 
@@ -379,31 +412,31 @@ mediaSource.addEventListener('sourceopen', () => {
 ## Architecture Overview
 
 ```
-                           ┌────────────────────┐
+                           ┌──────────────────┐
                            │     HTTP Server      │
                            │   (Go net/http)      │
-                           └───────────┬──────────┘
+                           └─────────┬─────────┘
                                       │
-          ┌───────────────────────────┼─────────────────────────────┐
+          ┌───────────────────────────┼───────────────────────────┐
           │                           │                           │
-    ┌─────▼─────┐          ┌──────────▼──────────┐          ┌─────▼─────┐
+    ┌─────▼─────┐          ┌──────────▼─────────┐          ┌──────▼──────┐
     │  REST API │          │ Audio WS            │          │ Screen WS │
     │  /create  │          │  /stream            │          │/screenshare│
     │  /check   │          │                     │          │           │
     │/update-token│        │                     │          │           │
     │  /remove  │          │                     │          │           │
-    └───────────┘          └──────────┬──────────┘          └─────┬─────┘
+    └───────────┘          └──────────┬─────────┘          └─────┬─────┘
                                       │                           │
-                              ┌───────▼───────┐        ┌──────────▼──────────┐
+                              ┌───────▼────────┐        ┌─────────▼─────────┐
                               │   Room Map    │        │  Room Map           │
                               │  clients[]    │        │ publisher           │
                               │  initSegs[]   │        │ viewers[]           │
-                              └───────┬───────┘        └──────────┬──────────┘
+                              └───────┬────────┘        └─────────┬─────────┘
                                       │                           │
-                              ┌───────▼───────┐                   │
+                              ┌───────▼────────┐                   │
                               │   Broadcast   │                   │
                               │  [ID+chunk]   │                   │
-                              └───────────────┘                   │
+                              └────────────────┘                   │
 ```
 
 | Layer            | Audio                          | Screen Share                     |

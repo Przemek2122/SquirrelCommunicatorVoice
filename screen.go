@@ -11,37 +11,38 @@ import (
 )
 
 // handleScreenShare handles WebSocket connections for screen sharing.
-// Two roles via query param ?role=publisher|viewer:
+// Two roles via ?role=publisher|viewer (or the X-Role header):
 //   - "publisher": sends video frames which are broadcast to that publisher's viewers
 //   - "viewer":    receives one specific publisher's screen stream
 //
 // Multiple publishers may share in the same voice channel at once (Discord-style).
 // A viewer chooses which publisher to watch via the ?target=<publisher_userid>
-// query param. Query params: room, userid, token, role, target.
+// query param (or the X-Target-User-Id header).
+// Params (header preferred, query string fallback): room, userid, token, role, target.
 func handleScreenShare(rm *RoomManager, w http.ResponseWriter, r *http.Request) {
-	// --- Parse query params ---
-	roomID := r.URL.Query().Get("room")
+	// --- Parse params (header preferred, query string fallback) ---
+	roomID := paramValue(r, "room")
 	if roomID == "" {
 		log.Println("[screen] Missing room name")
 		http.Error(w, "Missing room name", http.StatusBadRequest)
 		return
 	}
 
-	userId := r.URL.Query().Get("userid")
+	userId := paramValue(r, "userid")
 	if userId == "" {
 		log.Println("[screen] Missing userid")
 		http.Error(w, "Missing userid", http.StatusBadRequest)
 		return
 	}
 
-	token := r.URL.Query().Get("token")
+	token := paramValue(r, "token")
 	if token == "" {
 		log.Println("[screen] Missing room token")
 		http.Error(w, "Missing room token", http.StatusUnauthorized)
 		return
 	}
 
-	role := r.URL.Query().Get("role")
+	role := paramValue(r, "role")
 	if role != "publisher" && role != "viewer" {
 		log.Printf("[screen] Invalid role '%s' — must be 'publisher' or 'viewer'\n", role)
 		http.Error(w, "Invalid role. Use ?role=publisher or ?role=viewer", http.StatusBadRequest)
@@ -167,9 +168,10 @@ func handleScreenPublisher(rm *RoomManager, room *Room, conn *websocket.Conn, us
 }
 
 // handleScreenViewer connects a viewer to a specific publisher (selected by the
-// ?target= param) and relays that publisher's stream + signaling to it.
+// ?target= param or the X-Target-User-Id header) and relays that publisher's
+// stream + signaling to it.
 func handleScreenViewer(rm *RoomManager, room *Room, conn *websocket.Conn, userId, roomID string, r *http.Request) {
-	targetUserID := r.URL.Query().Get("target")
+	targetUserID := paramValue(r, "target")
 	if targetUserID == "" {
 		log.Printf("[screen] Viewer [%s] in room [%s] did not specify a target publisher\n", userId, roomID)
 		resp, _ := json.Marshal(map[string]string{"error": "No target publisher specified"})
