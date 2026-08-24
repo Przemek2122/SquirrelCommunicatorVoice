@@ -5,13 +5,15 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
 
 var upgrader = websocket.Upgrader{
-	// Allow connections from any origin — authentication is handled via room tokens
-	// and API keys, so origin checking is unnecessary for this microservice.
+	// Allow connections from any origin — authentication is handled via room
+	// tokens and API keys, so origin checking is unnecessary for this
+	// microservice (there are no ambient credentials like cookies to protect).
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
@@ -25,16 +27,15 @@ func main() {
 	maxScreenSharesPerRoom = GetMaxScreenSharesPerRoom()
 	fmt.Printf("Max concurrent screen shares per room: %d\n", maxScreenSharesPerRoom)
 
-	// Debug room
-	manager.CreateRoom("test", "test")
-
-	// Ensure we have APIKey or log
+	// Require an API key before serving. With an empty key, every REST handler's
+	// check (clientToken != rm.APIKey) would pass for an absent token, leaving
+	// room create/remove/update open to anyone. Fail fast instead of running
+	// with an open admin API.
 	manager.APIKey = GetAPIKey()
-	if manager.APIKey == "" { // @TODO: Temporary allow empty key
-		log.Printf("[WARNING] Server APIKey missing, we will allow anyone")
-	} else {
-		fmt.Printf("Server has APIKey and will require it to connect\n")
+	if manager.APIKey == "" {
+		log.Fatal("[FATAL] SQRLL_VOICE_API_KEY is not set — refusing to start with an open admin API")
 	}
+	fmt.Printf("Server requires an API key to manage rooms\n")
 
 	// --- REST API ---
 	http.HandleFunc("/api/rooms/create", manager.handleCreateRoomAPI)
@@ -53,9 +54,21 @@ func main() {
 	http.HandleFunc("/health", handleHealthCheck)
 
 	addr := net.JoinHostPort(GetAddress(), GetPort())
-	fmt.Printf("Go Microservice (Rooms) listening on '%s'...", addr)
-	err := http.ListenAndServe(addr, nil)
-	if err != nil {
+
+	// Explicit server timeouts. ReadHeaderTimeout defeats slowloris-style
+	// attacks on the HTTP handshake; IdleTimeout reaps idle keep-alive
+	// connections. Read/WriteTimeout are deliberately left unset: WebSocket
+	// connections are hijacked after the handshake and must never be subject to
+	// a total request timeout.
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           nil, // DefaultServeMux
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	fmt.Printf("Go Microservice (Rooms) listening on '%s'...\n", addr)
+	err := server.ListenAndServe()
+	if err != nil && err != http.ErrServerClosed {
 		log.Fatal("Server error: ", err)
 	}
 }

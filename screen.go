@@ -63,12 +63,11 @@ func handleScreenShare(rm *RoomManager, w http.ResponseWriter, r *http.Request) 
 	}
 	defer func() { _ = conn.Close() }()
 
-	// Keep the connection alive with periodic pings. Cloudflare (and other
-	// proxies) drop idle WebSocket connections after ~100 seconds, so a 60s
-	// ping prevents silent disconnects. WriteControl is used internally and is
-	// safe to run concurrently with the read loop below.
-	stopPing := startPingLoop(conn, pingInterval)
-	defer stopPing()
+	// Keep the connection alive with periodic pings AND detect half-dead peers
+	// (no data + no pong within pongWait) so they are torn down rather than
+	// leaked. See startHeartbeat.
+	stopHeartbeat := startHeartbeat(conn)
+	defer stopHeartbeat()
 
 	// Set a generous read limit for video frames (up to ~5MB)
 	conn.SetReadLimit(5 << 20) // 5 MB
@@ -211,7 +210,7 @@ func handleScreenViewer(rm *RoomManager, room *Room, conn *websocket.Conn, userI
 		// guarantees no media reaches this viewer before MarkScreenInitDelivered.
 		log.Printf("screenshare init served: room=%s userid=%s bytes=%d", roomID, userId, len(initSeg))
 		room.screenWriteMu.Lock()
-		err := conn.WriteMessage(websocket.BinaryMessage, initSeg)
+		err := writeMessage(conn, websocket.BinaryMessage, initSeg, screenWriteTimeout)
 		room.screenWriteMu.Unlock()
 		if err != nil {
 			log.Printf("[screen] Error sending init segment to viewer [%s]: %v\n", userId, err)

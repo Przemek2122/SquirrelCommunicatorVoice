@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/subtle"
 	"os"
 	"strconv"
 )
@@ -41,4 +42,14 @@ func GetMaxScreenSharesPerRoom() int {
 		return 5
 	}
 	return n
+}
+
+// secureEqual compares two strings in constant time, which prevents a timing
+// side channel when checking API keys or room tokens. It returns false for
+// different lengths (length is not considered secret).
+func secureEqual(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }

@@ -232,6 +232,13 @@ func NewRoomManager() *RoomManager {
 	}
 }
 
+// isAuthorized reports whether the supplied client token matches the service
+// API key, using a constant-time comparison. It also rejects an empty client
+// token outright (the key itself is never empty, enforced at startup).
+func (rm *RoomManager) isAuthorized(clientToken string) bool {
+	return secureEqual(clientToken, rm.APIKey)
+}
+
 // CreateRoom Create room or get if exists and token matches
 func (rm *RoomManager) CreateRoom(roomID string, token string) *Room {
 	rm.mutex.Lock()
@@ -239,7 +246,7 @@ func (rm *RoomManager) CreateRoom(roomID string, token string) *Room {
 
 	roomIfExists, exists := rm.rooms[roomID]
 	if exists {
-		if roomIfExists.token != token {
+		if !roomIfExists.tokenMatches(token) {
 			fmt.Printf("Tried to join room with incorrect token: %s", roomID)
 			return nil
 		}
@@ -350,6 +357,14 @@ func (r *Room) SetToken(newToken string) {
 	r.token = newToken
 }
 
+// tokenMatches reports whether the given token matches the room's token,
+// reading under the room lock so it can never race a concurrent SetToken.
+func (r *Room) tokenMatches(token string) bool {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	return secureEqual(r.token, token)
+}
+
 // JoinRoom adds a client to a specific room, creating it if it doesn't exist
 func (rm *RoomManager) JoinRoom(roomID string, token string, userId string, conn *websocket.Conn) *Room {
 	rm.mutex.Lock()
@@ -363,7 +378,7 @@ func (rm *RoomManager) JoinRoom(roomID string, token string, userId string, conn
 	}
 
 	// Is token correct
-	if room.token != token {
+	if !room.tokenMatches(token) {
 		fmt.Printf("Tried to join room with incorrect token: %s", roomID)
 		return nil
 	}
@@ -449,7 +464,7 @@ func (rm *RoomManager) GetRoom(roomID string, token string) *Room {
 		return nil
 	}
 
-	if room.token != token {
+	if !room.tokenMatches(token) {
 		fmt.Printf("Tried to join room with incorrect token: %s\n", roomID)
 		return nil
 	}
@@ -580,7 +595,7 @@ func (r *Room) Broadcast(sender *websocket.Conn, message []byte) {
 			final = append(final, idLen)
 			final = append(final, idBytes...)
 			final = append(final, unit...)
-			if err := client.WriteMessage(websocket.BinaryMessage, final); err != nil {
+			if err := writeMessage(client, websocket.BinaryMessage, final, writeTimeout); err != nil {
 				log.Printf("Error broadcasting to a client in room %s: %v", r.id, err)
 
 				// Remove the dead connection immediately so we stop trying to
@@ -624,7 +639,7 @@ func (r *Room) SendKeyframe(requester *websocket.Conn, targetUserID string) {
 
 	r.audioWriteMu.Lock()
 	defer r.audioWriteMu.Unlock()
-	if err := requester.WriteMessage(websocket.BinaryMessage, initChunk); err != nil {
+	if err := writeMessage(requester, websocket.BinaryMessage, initChunk, writeTimeout); err != nil {
 		log.Printf("Error sending keyframe to client in room %s: %v", r.id, err)
 	}
 }
@@ -838,7 +853,7 @@ func (r *Room) BroadcastScreen(pub *screenPublisher, message []byte) {
 	r.screenWriteMu.Lock()
 	defer r.screenWriteMu.Unlock()
 	for _, w := range writes {
-		if err := w.conn.WriteMessage(websocket.BinaryMessage, w.data); err != nil {
+		if err := writeMessage(w.conn, websocket.BinaryMessage, w.data, screenWriteTimeout); err != nil {
 			log.Printf("Error broadcasting screen in room %s: %v", r.id, err)
 			_ = w.conn.Close()
 		}
@@ -864,7 +879,7 @@ func (r *Room) SendScreenKeyframe(pub *screenPublisher, requester *websocket.Con
 
 	r.screenWriteMu.Lock()
 	defer r.screenWriteMu.Unlock()
-	if err := requester.WriteMessage(websocket.BinaryMessage, keyframe); err != nil {
+	if err := writeMessage(requester, websocket.BinaryMessage, keyframe, screenWriteTimeout); err != nil {
 		log.Printf("Error sending screen keyframe in room %s: %v", r.id, err)
 	}
 }
@@ -964,7 +979,7 @@ func (r *Room) sendToViewerByUserID(pub *screenPublisher, userID string, data []
 
 	r.screenWriteMu.Lock()
 	defer r.screenWriteMu.Unlock()
-	if err := target.WriteMessage(websocket.TextMessage, data); err != nil {
+	if err := writeMessage(target, websocket.TextMessage, data, writeTimeout); err != nil {
 		log.Printf("Error sending signaling to screen viewer %s in room %s: %v", userID, r.id, err)
 	}
 }
@@ -974,7 +989,7 @@ func (r *Room) sendToViewerByUserID(pub *screenPublisher, userID string, data []
 func (p *screenPublisher) send(data []byte) {
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
-	if err := p.conn.WriteMessage(websocket.TextMessage, data); err != nil {
+	if err := writeMessage(p.conn, websocket.TextMessage, data, writeTimeout); err != nil {
 		log.Printf("Error sending signaling to screen publisher: %v", err)
 	}
 }
@@ -1019,7 +1034,7 @@ func (r *Room) broadcastModeToViewers(pub *screenPublisher, mode string) {
 	r.screenWriteMu.Lock()
 	defer r.screenWriteMu.Unlock()
 	for _, conn := range viewers {
-		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+		if err := writeMessage(conn, websocket.TextMessage, data, writeTimeout); err != nil {
 			log.Printf("Error broadcasting mode in room %s: %v", r.id, err)
 		}
 	}
@@ -1030,7 +1045,7 @@ func (r *Room) NotifyViewerMode(conn *websocket.Conn, mode string) {
 	data, _ := json.Marshal(map[string]string{"type": "mode", "mode": mode})
 	r.screenWriteMu.Lock()
 	defer r.screenWriteMu.Unlock()
-	if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+	if err := writeMessage(conn, websocket.TextMessage, data, writeTimeout); err != nil {
 		log.Printf("Error sending mode to screen viewer in room %s: %v", r.id, err)
 	}
 }
@@ -1041,7 +1056,7 @@ func (r *Room) NotifyViewerMode(conn *websocket.Conn, mode string) {
 func (r *Room) SendToScreenViewerConn(conn *websocket.Conn, data []byte) {
 	r.screenWriteMu.Lock()
 	defer r.screenWriteMu.Unlock()
-	if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+	if err := writeMessage(conn, websocket.TextMessage, data, writeTimeout); err != nil {
 		log.Printf("Error sending signaling to screen viewer in room %s: %v", r.id, err)
 	}
 }
@@ -1068,7 +1083,7 @@ func (r *Room) BroadcastScreenShareState(state, userID string) {
 	r.audioWriteMu.Lock()
 	defer r.audioWriteMu.Unlock()
 	for _, c := range targets {
-		if err := c.WriteMessage(websocket.TextMessage, data); err != nil {
+		if err := writeMessage(c, websocket.TextMessage, data, writeTimeout); err != nil {
 			log.Printf("Error broadcasting %s in room %s: %v", state, r.id, err)
 		}
 	}
@@ -1087,7 +1102,7 @@ func (r *Room) NotifyScreenShareState(conn *websocket.Conn, state, userID string
 func (r *Room) SendToAudioClient(conn *websocket.Conn, data []byte) {
 	r.audioWriteMu.Lock()
 	defer r.audioWriteMu.Unlock()
-	if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+	if err := writeMessage(conn, websocket.TextMessage, data, writeTimeout); err != nil {
 		log.Printf("Error sending signaling to audio client in room %s: %v", r.id, err)
 	}
 }

@@ -14,40 +14,67 @@ const (
 	// 60-second ping keeps every connection comfortably under that threshold.
 	pingInterval = 60 * time.Second
 
+	// pongWait is how long we allow without hearing from the peer before
+	// declaring it dead. It must be greater than pingInterval so a client that
+	// answers every ping with a pong never trips the read deadline.
+	pongWait = 70 * time.Second
+
 	// pingWriteTimeout bounds how long a single ping write may block before the
-	// connection is considered dead and the ping goroutine gives up.
+	// connection is considered dead and closed.
 	pingWriteTimeout = 10 * time.Second
+
+	// writeTimeout bounds each data write on the audio/signaling path. It keeps
+	// one slow or stalled client from holding a room's write mutex and freezing
+	// everyone else's stream (head-of-line blocking).
+	writeTimeout = 2 * time.Second
+
+	// screenWriteTimeout is the same bound for the (larger) screen-share data
+	// path. Screen keyframes can be a few MB, so the budget is more generous.
+	screenWriteTimeout = 5 * time.Second
 )
 
-// startPingLoop starts a background goroutine that sends a native WebSocket
-// ping control frame (opcode 0x9) on every tick of interval. It returns a stop
-// function that cleanly terminates the goroutine and stops the ticker.
+// writeMessage sets a short write deadline and writes a single message. It is
+// used on every mutex-protected data-path write so a stalled client fails fast
+// (and is then dropped by the caller) instead of blocking the whole room.
+func writeMessage(conn *websocket.Conn, messageType int, data []byte, timeout time.Duration) error {
+	_ = conn.SetWriteDeadline(time.Now().Add(timeout))
+	return conn.WriteMessage(messageType, data)
+}
+
+// startHeartbeat configures a WebSocket connection with the standard gorilla
+// keep-alive pattern and starts a background ping goroutine:
 //
-// Why WriteControl (not WriteMessage):
+//   - SetPongHandler: a pong from the peer extends the read deadline, so an
+//     idle-but-alive client never times out.
+//   - SetReadDeadline(pongWait): if the peer neither sends data nor answers a
+//     ping within pongWait, the handler's ReadMessage returns a timeout and the
+//     connection is torn down. This detects half-dead clients (laptop sleep,
+//     network drop without FIN) that would otherwise leak forever.
+//   - The ping goroutine sends a native ping (opcode 0x9) every pingInterval.
+//     If the write fails, the peer is gone, so the connection is closed to
+//     unblock the handler's read loop.
 //
-//   - WriteControl is explicitly safe to call concurrently with the data path
-//     (WriteMessage) and with the read loop, so the pings never race media
-//     writes or interfere with incoming messages.
-//   - A ping is a control frame (opcode 0x9), so the browser answers it with a
-//     pong automatically at the protocol level without any JS involvement.
-//
-// The goroutine also self-terminates when the underlying connection closes,
-// because WriteControl returns an error once the connection is closed. The
-// returned stop function is therefore a fast, deterministic shutdown path on
-// top of that (it lets the handler stop the goroutine before conn.Close runs,
-// rather than waiting up to one full interval for the next failed write).
-func startPingLoop(conn *websocket.Conn, interval time.Duration) func() {
+// It returns a stop function that cleanly terminates the goroutine.
+func startHeartbeat(conn *websocket.Conn) func() {
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(pongWait))
+	})
+	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+
 	stop := make(chan struct{})
 	var once sync.Once
 
 	go func() {
-		ticker := time.NewTicker(interval)
+		ticker := time.NewTicker(pingInterval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
 				deadline := time.Now().Add(pingWriteTimeout)
 				if err := conn.WriteControl(websocket.PingMessage, nil, deadline); err != nil {
+					// The peer is gone (write failed). Close the connection so
+					// the handler's blocked ReadMessage unblocks and cleans up.
+					_ = conn.Close()
 					return
 				}
 			case <-stop:

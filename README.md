@@ -6,7 +6,7 @@
 ##### Initial setup: (os env)
 ###### SQRLL_VOICE_ADDRESS – Bind address for the server (default: all interfaces). Example: `127.0.0.1` to bind to localhost only.
 ###### SQRLL_VOICE_PORT – Change port which this server will run on.
-###### SQRLL_VOICE_API_KEY – Key for server to access sensitive functions (create room, etc)
+###### SQRLL_VOICE_API_KEY – Key for server to access sensitive functions (create room, etc). **Required** — the server refuses to start if it is unset.
 ###### SQRLL_MAX_SCREENSHARES_PER_ROOM – Max concurrent screen shares per room (default 5)
 
 ---
@@ -49,6 +49,7 @@ Creates a new room (or returns the existing room if the token matches).
 |--------|----------------------------|
 | 400    | Invalid JSON / missing roomId |
 | 401    | Missing or wrong API key   |
+| 409    | Room already exists with a different token |
 | 405    | Not a POST request         |
 
 ---

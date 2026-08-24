@@ -9,6 +9,12 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
+// maxAudioReadBytes bounds the size of a single message the server will accept
+// on the audio WebSocket. Without an explicit limit gorilla allows unbounded
+// frames, so a client could send a huge frame and force the server to allocate
+// it all in memory before the relay's safety valve ever sees it.
+const maxAudioReadBytes = 1 << 20
+
 type CreateRoomRequest struct {
 	RoomId string `json:"roomId"`
 	Token  string `json:"token"`
@@ -39,7 +45,7 @@ func (rm *RoomManager) handleCreateRoomAPI(w http.ResponseWriter, r *http.Reques
 
 	// Check token (Server should send auth)
 	clientToken := r.Header.Get("X-API-Token")
-	if clientToken != rm.APIKey {
+	if !rm.isAuthorized(clientToken) {
 		writeJSONError(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -58,7 +64,14 @@ func (rm *RoomManager) handleCreateRoomAPI(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	rm.CreateRoom(req.RoomId, req.Token)
+	room := rm.CreateRoom(req.RoomId, req.Token)
+	if room == nil {
+		// CreateRoom returns nil when the room already exists with a different
+		// token, meaning the caller did NOT actually create/claim it. Surface
+		// that instead of falsely reporting "201 created".
+		writeJSONError(w, "Room already exists with a different token", http.StatusConflict)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -80,7 +93,7 @@ func (rm *RoomManager) handleUpdateRoomTokenAPI(w http.ResponseWriter, r *http.R
 
 	// Check auth
 	clientToken := r.Header.Get("X-API-Token")
-	if clientToken != rm.APIKey {
+	if !rm.isAuthorized(clientToken) {
 		writeJSONError(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -130,7 +143,7 @@ func (rm *RoomManager) handleRemoveRoomAPI(w http.ResponseWriter, r *http.Reques
 
 	// Check auth
 	clientToken := r.Header.Get("X-API-Token")
-	if clientToken != rm.APIKey {
+	if !rm.isAuthorized(clientToken) {
 		writeJSONError(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -176,7 +189,7 @@ func (rm *RoomManager) handleCheckRoomAPI(w http.ResponseWriter, r *http.Request
 
 	// Check token (Server should send auth)
 	clientToken := r.Header.Get("X-API-Token")
-	if clientToken != rm.APIKey {
+	if !rm.isAuthorized(clientToken) {
 		writeJSONError(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -230,12 +243,15 @@ func handleAudioStream(rm *RoomManager, w http.ResponseWriter, r *http.Request) 
 	}
 	defer func() { _ = conn.Close() }()
 
-	// Keep the connection alive with periodic pings. Cloudflare (and other
-	// proxies) drop idle WebSocket connections after ~100 seconds, so a 60s
-	// ping prevents silent disconnects. WriteControl is used internally and is
-	// safe to run concurrently with the read loop below.
-	stopPing := startPingLoop(conn, pingInterval)
-	defer stopPing()
+	// Bound the size of a single inbound message so a malicious client can't
+	// force a huge allocation (see maxAudioReadBytes).
+	conn.SetReadLimit(maxAudioReadBytes)
+
+	// Keep the connection alive with periodic pings AND detect half-dead peers
+	// (no data + no pong within pongWait) so they are torn down rather than
+	// leaked. See startHeartbeat.
+	stopHeartbeat := startHeartbeat(conn)
+	defer stopHeartbeat()
 
 	// 1. Client joins the requested room
 	room := rm.JoinRoom(roomID, token, userId, conn)
